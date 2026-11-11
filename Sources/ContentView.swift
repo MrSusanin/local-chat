@@ -3,8 +3,10 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
+    @StateObject private var network = NetworkMonitor()
     @Environment(\.scenePhase) private var scenePhase
     @State private var input = ""
+    @State private var showHistory = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -17,15 +19,29 @@ struct ContentView: View {
                 }
             }
             .background(Color.black.ignoresSafeArea())
-            .navigationTitle("Локальный чат")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    statusHeader
+                }
                 if vm.loadState == .ready {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            inputFocused = false
+                            showHistory = true
+                        } label: {
+                            Image(systemName: "clock.arrow.circlepath")
+                        }
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         Menu {
                             Button("Новый чат", systemImage: "square.and.pencil") {
                                 vm.newChat()
                             }
+                            ShareLink(item: vm.exportText) {
+                                Label("Поделиться чатом", systemImage: "square.and.arrow.up")
+                            }
+                            .disabled(vm.messages.isEmpty)
                             Button("Сменить модель", systemImage: "cpu") {
                                 vm.unloadModel()
                             }
@@ -36,11 +52,51 @@ struct ContentView: View {
                 }
             }
         }
+        .sheet(isPresented: $showHistory) {
+            HistoryView(vm: vm)
+        }
         .onChange(of: scenePhase) { _, phase in
-            // В фоне GPU недоступен, поэтому генерацию останавливаем.
-            if phase != .active { vm.stop() }
+            // В фоне GPU недоступен, поэтому генерацию останавливаем и сохраняем чат.
+            if phase != .active {
+                vm.stop()
+                vm.saveCurrent()
+            }
         }
         .onAppear { vm.autoLoadIfPossible() }
+    }
+
+    // MARK: - Заголовок со статусом
+
+    private var statusInfo: (text: String, color: Color) {
+        switch vm.loadState {
+        case .ready:
+            if vm.isGenerating { return (text: "Думает…", color: Color.orange) }
+            return (text: "Модель готова", color: Color.green)
+        case .starting:
+            return (text: "Запуск модели…", color: Color.orange)
+        case .downloading(let progress):
+            return (text: "Загрузка \(Int(progress * 100))%", color: Color.orange)
+        case .idle:
+            return (text: "Модель не загружена", color: Color.gray)
+        case .failed:
+            return (text: "Ошибка модели", color: Color.red)
+        }
+    }
+
+    private var statusHeader: some View {
+        let status = statusInfo
+        return VStack(spacing: 1) {
+            Text("Локальный чат")
+                .font(.headline)
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(status.color)
+                    .frame(width: 7, height: 7)
+                Text(status.text + (network.isOnline ? " · онлайн" : " · офлайн"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     // MARK: - Экран чата
@@ -68,6 +124,9 @@ struct ContentView: View {
                 .onChange(of: vm.messages) { _, _ in
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
+                .onAppear {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
             }
             inputBar
         }
@@ -80,7 +139,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text("Спросите что-нибудь")
                 .font(.title3.weight(.semibold))
-            Text("Всё работает на вашем iPhone, без интернета.\nМодель небольшая, так что сложные вопросы ей даются хуже, чем большим ИИ.")
+            Text("Всё работает на вашем iPhone, без интернета.\nМожно вставлять и длинные тексты: приложение прочитает их по частям.")
                 .font(.footnote)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
@@ -184,17 +243,28 @@ struct ContentView: View {
             )
         }
         .buttonStyle(.plain)
-        .disabled(isDownloading)
+        .disabled(isBusy)
     }
 
-    private var isDownloading: Bool {
-        if case .downloading = vm.loadState { return true }
-        return false
+    private var isBusy: Bool {
+        switch vm.loadState {
+        case .starting, .downloading: return true
+        default: return false
+        }
     }
 
     @ViewBuilder
     private var setupStatus: some View {
         switch vm.loadState {
+        case .starting:
+            VStack(spacing: 10) {
+                ProgressView()
+                    .tint(.orange)
+                Text("Запускаю модель…")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 6)
         case .downloading(let progress):
             VStack(spacing: 8) {
                 ProgressView(value: progress)
@@ -236,6 +306,80 @@ struct ContentView: View {
         .padding(.top, 6)
     }
 }
+
+// MARK: - История чатов
+
+private struct HistoryView: View {
+    @ObservedObject var vm: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if vm.conversations.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "clock")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary)
+                        Text("Сохранённых чатов пока нет")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        ForEach(vm.conversations) { conversation in
+                            Button {
+                                vm.openChat(conversation.id)
+                                dismiss()
+                            } label: {
+                                row(conversation)
+                            }
+                        }
+                        .onDelete { offsets in
+                            let ids = offsets.map { vm.conversations[$0].id }
+                            for id in ids { vm.deleteChat(id) }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("История")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Новый чат") {
+                        vm.newChat()
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Готово") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func row(_ conversation: Conversation) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(conversation.title)
+                    .font(.body)
+                    .lineLimit(1)
+                    .foregroundColor(.white)
+                Text("\(conversation.messages.count) сообщ. · \(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if conversation.id == vm.currentID {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+}
+
+// MARK: - Сообщение
 
 private struct MessageBubble: View {
     let message: ChatMessage
