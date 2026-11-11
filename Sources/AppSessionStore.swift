@@ -1,33 +1,70 @@
 import Foundation
 import SwiftUI
 
+@MainActor
 final class AppSessionStore: ObservableObject {
     @Published var isAuthenticated: Bool {
         didSet { UserDefaults.standard.set(isAuthenticated, forKey: "isAuthenticated") }
     }
 
     @Published var selectedProvider: AIProvider {
-        didSet { UserDefaults.standard.set(selectedProvider.rawValue, forKey: "selectedProvider") }
+        didSet {
+            UserDefaults.standard.set(selectedProvider.rawValue, forKey: "selectedProvider")
+            do {
+                apiKey = try KeychainStore.read(account: selectedProvider.rawValue) ?? ""
+                credentialError = nil
+            } catch {
+                apiKey = ""
+                credentialError = "Не удалось прочитать ключ из Keychain."
+            }
+        }
     }
 
     @Published var apiKey: String {
-        didSet { UserDefaults.standard.set(apiKey, forKey: "providerApiKey") }
+        didSet {
+            do {
+                try KeychainStore.write(apiKey, account: selectedProvider.rawValue)
+                credentialError = nil
+            } catch {
+                credentialError = "Не удалось сохранить API-ключ в Keychain."
+            }
+        }
     }
 
     @Published var selectedModelName: String {
         didSet { UserDefaults.standard.set(selectedModelName, forKey: "selectedModelName") }
     }
 
-    init() {
-        let storedLoggedIn = UserDefaults.standard.bool(forKey: "isAuthenticated")
-        let providerValue = UserDefaults.standard.string(forKey: "selectedProvider") ?? AIProvider.local.rawValue
-        let provider = AIProvider(rawValue: providerValue) ?? .local
-        let storedModel = UserDefaults.standard.string(forKey: "selectedModelName") ?? provider.defaultModelName
+    @Published private(set) var credentialError: String?
 
-        self.isAuthenticated = storedLoggedIn
+    init() {
+        let defaults = UserDefaults.standard
+        let providerRaw = defaults.string(forKey: "selectedProvider") ?? AIProvider.local.rawValue
+        let provider = AIProvider(rawValue: providerRaw) ?? .local
+        let modelName = defaults.string(forKey: "selectedModelName") ?? provider.defaultModelName
+
+        self.isAuthenticated = defaults.bool(forKey: "isAuthenticated")
         self.selectedProvider = provider
-        self.apiKey = UserDefaults.standard.string(forKey: "providerApiKey") ?? ""
-        self.selectedModelName = storedModel
+        self.selectedModelName = modelName
+
+        let legacyKey = defaults.string(forKey: "providerApiKey")
+        let storedKey: String?
+        do {
+            storedKey = try KeychainStore.read(account: provider.rawValue)
+        } catch {
+            storedKey = nil
+            self.credentialError = "Не удалось прочитать ключ из Keychain."
+        }
+        self.apiKey = storedKey ?? legacyKey ?? ""
+
+        if storedKey == nil, let legacyKey, !legacyKey.isEmpty {
+            do {
+                try KeychainStore.write(legacyKey, account: provider.rawValue)
+                defaults.removeObject(forKey: "providerApiKey")
+            } catch {
+                self.credentialError = "Не удалось перенести API-ключ в Keychain."
+            }
+        }
     }
 
     var currentProfile: AIModelProfile {
@@ -38,16 +75,13 @@ final class AppSessionStore: ObservableObject {
         )
     }
 
+    /// Local UI gate only; this does not authenticate against a server or create an account.
     func login(username: String, password: String) -> Bool {
-        let trimmedUser = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedPass = password.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let valid = !trimmedUser.isEmpty && trimmedUser.count >= 2 && !trimmedPass.isEmpty && trimmedPass.count >= 4
-        if valid {
-            isAuthenticated = true
-            return true
-        }
-        return false
+        let user = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pass = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard user.count >= 2, pass.count >= 4 else { return false }
+        isAuthenticated = true
+        return true
     }
 
     func logout() {
