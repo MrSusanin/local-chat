@@ -35,6 +35,69 @@ enum LoadState: Equatable {
     case failed(String)
 }
 
+/// Режим нагрузки на телефон. Меняет не саму модель, а то, как приложение с ней работает:
+/// как часто обновляется экран, какими порциями читаются длинные тексты, есть ли паузы
+/// между порциями и какой длины бывают ответы.
+enum PerformanceMode: String, CaseIterable, Identifiable {
+    case eco, balanced, max
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .eco: return "Экономный"
+        case .balanced: return "Сбалансированный"
+        case .max: return "Максимальный"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .eco:
+            return "Меньше нагрузки и нагрева, интерфейс не лагает. Экран обновляется реже, длинные тексты читаются мелкими частями с паузами, ответы до ~500 токенов."
+        case .balanced:
+            return "Золотая середина для повседневной работы. Ответы до ~800 токенов."
+        case .max:
+            return "Самые быстрые обновления и самые длинные ответы (до ~1200 токенов). Телефон греется сильнее, возможны подтормаживания."
+        }
+    }
+
+    /// Как часто (в секундах) обновляется текст ответа на экране.
+    var uiInterval: TimeInterval {
+        switch self {
+        case .eco: return 0.35
+        case .balanced: return 0.12
+        case .max: return 0.03
+        }
+    }
+
+    var maxTokens: Int {
+        switch self {
+        case .eco: return 500
+        case .balanced: return 800
+        case .max: return 1200
+        }
+    }
+
+    /// Размер одной части при чтении длинного текста (в символах).
+    var chunkSize: Int {
+        switch self {
+        case .eco: return 1800
+        case .balanced: return 2500
+        case .max: return 3000
+        }
+    }
+
+    /// Пауза между частями длинного текста, чтобы телефон успевал остыть.
+    var pauseSeconds: Double {
+        switch self {
+        case .eco: return 1.5
+        case .balanced: return 0.4
+        case .max: return 0
+        }
+    }
+}
+
 private enum LongTextError: LocalizedError {
     case lowMemory
 
@@ -68,13 +131,12 @@ final class ChatViewModel: ObservableObject {
     // Пороговые значения (в символах). Подобраны для iPhone с 4 ГБ памяти.
     private static let longTextThreshold = 3000      // выше этого текст обрабатывается по частям
     private static let maxLongTextChars = 60_000     // больше не читаем
-    private static let chunkSize = 2500              // размер одной части
     private static let notesLimit = 6000             // максимум выжимок, которые отдаём в финальный запрос
     private static let sessionResetChars = 6000      // после этого объёма диалога контекст пересобирается
     private static let mb = 1_048_576
     private static let writeQueue = DispatchQueue(label: "localchat.store", qos: .utility)
 
-    private let systemPrompt =
+    private let baseSystemPrompt =
         "Ты дружелюбный и полезный ассистент. Отвечай на том языке, на котором пишет пользователь. " +
         "Отвечай кратко и по делу. Если не знаешь ответа, так и скажи."
 
@@ -87,6 +149,36 @@ final class ChatViewModel: ObservableObject {
         didSet { UIApplication.shared.isIdleTimerDisabled = isGenerating }
     }
 
+    /// Режим нагрузки. Новый режим применяется со следующего сообщения.
+    @Published var mode: PerformanceMode = .balanced {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "perfMode")
+            sessionDirty = true
+        }
+    }
+
+    /// Свои инструкции для ассистента (например, «отвечай коротко»).
+    @Published var customInstructions: String = "" {
+        didSet {
+            if customInstructions.count > 500 {
+                customInstructions = String(customInstructions.prefix(500))
+            }
+            UserDefaults.standard.set(customInstructions, forKey: "customInstructions")
+            sessionDirty = true
+        }
+    }
+
+    /// Какие сообщения пользователь вручную свернул или развернул.
+    @Published private(set) var toggledIDs: Set<UUID> = []
+
+    /// Просьбы к экрану прокрутить: к началу нового сообщения или в самый низ.
+    @Published private(set) var scrollRequest: UUID?
+    @Published private(set) var bottomRequest = 0
+
+    /// Сообщение, написанное, пока модель ещё запускалась.
+    @Published private(set) var queuedPrompt: String?
+
+    private var loadAttempt: UUID?
     private var container: ModelContainer?
     private var session: ChatSession?
     private var sessionChars = 0
@@ -104,11 +196,23 @@ final class ChatViewModel: ObservableObject {
         loadState = defaults.bool(forKey: "downloaded.\(id)") ? .starting : .idle
         storeURL = Self.makeStoreURL()
 
+        mode = PerformanceMode(rawValue: defaults.string(forKey: "perfMode") ?? "") ?? .balanced
+        customInstructions = defaults.string(forKey: "customInstructions") ?? ""
+
         conversations = Self.readConversations(from: storeURL)
         if let last = conversations.first {
             currentID = last.id
             messages = last.messages
         }
+    }
+
+    private var systemPrompt: String {
+        var prompt = baseSystemPrompt
+        let extra = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !extra.isEmpty {
+            prompt += "\n\nДополнительные инструкции пользователя: " + extra
+        }
+        return prompt
     }
 
     // MARK: - Модель
@@ -120,35 +224,112 @@ final class ChatViewModel: ObservableObject {
     func loadModel() {
         guard !isLoadingModel else { return }
         isLoadingModel = true
+        let attempt = UUID()
+        loadAttempt = attempt
 
         let id = selectedModelID
         let defaults = UserDefaults.standard
         defaults.set(id, forKey: "selectedModel")
-        loadState = defaults.bool(forKey: "downloaded.\(id)") ? .starting : .downloading(0)
+        let wasDownloaded = defaults.bool(forKey: "downloaded.\(id)")
+        loadState = wasDownloaded ? .starting : .downloading(0)
+        // Если модель уже скачана, читаем её прямо из папки на телефоне
+        // и не обращаемся к Hugging Face при каждом запуске.
+        let localURL = wasDownloaded ? Self.localModelURL(for: id) : nil
 
         Task {
             do {
-                let loaded = try await LLMModelFactory.shared.loadContainer(
-                    configuration: ModelConfiguration(id: id)
-                ) { [weak self] progress in
-                    let fraction = progress.fractionCompleted
-                    Task { @MainActor in
-                        self?.updateProgress(fraction)
-                    }
-                }
+                let loaded = try await openContainer(id: id, localURL: localURL)
+                guard loadAttempt == attempt else { return }   // модель успели сменить
                 container = loaded
                 session = makeSession(for: loaded, transcript: contextTranscript())
                 sessionDirty = false
                 defaults.set(true, forKey: "downloaded.\(id)")
                 loadState = .ready
+                isLoadingModel = false
+
+                if let queued = queuedPrompt {
+                    queuedPrompt = nil
+                    send(queued)
+                } else {
+                    warmUp(loaded)
+                }
             } catch {
+                guard loadAttempt == attempt else { return }
                 loadState = .failed(
                     "Не удалось загрузить модель: \(error.localizedDescription)\n" +
                     "Проверьте интернет и свободное место, затем попробуйте ещё раз."
                 )
+                queuedPrompt = nil
+                isLoadingModel = false
             }
-            isLoadingModel = false
         }
+    }
+
+    /// Сначала пробуем быструю загрузку из локальной папки, при неудаче обычную.
+    private func openContainer(id: String, localURL: URL?) async throws -> ModelContainer {
+        let handler: @Sendable (Progress) -> Void = { [weak self] progress in
+            let fraction = progress.fractionCompleted
+            Task { @MainActor in
+                self?.updateProgress(fraction)
+            }
+        }
+
+        if let localURL {
+            do {
+                return try await LLMModelFactory.shared.loadContainer(
+                    configuration: ModelConfiguration(directory: localURL)
+                ) { handler($0) }
+            } catch {
+                // Не вышло (например, другая структура папок): загружаем обычным способом.
+            }
+        }
+        return try await LLMModelFactory.shared.loadContainer(
+            configuration: ModelConfiguration(id: id)
+        ) { handler($0) }
+    }
+
+    /// Где библиотека хранит скачанную модель. Если файлов там нет, возвращает nil.
+    private static func localModelURL(for id: String) -> URL? {
+        let manager = FileManager.default
+        guard let documents = manager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directory = documents.appendingPathComponent("huggingface/models/\(id)", isDirectory: true)
+        guard manager.fileExists(atPath: directory.appendingPathComponent("config.json").path) else {
+            return nil
+        }
+        let files = (try? manager.contentsOfDirectory(atPath: directory.path)) ?? []
+        guard files.contains(where: { $0.hasSuffix(".safetensors") }) else { return nil }
+        return directory
+    }
+
+    /// «Прогрев»: один крошечный запрос, пока вы читаете экран или печатаете.
+    /// Первый настоящий ответ после этого приходит быстрее.
+    private func warmUp(_ container: ModelContainer) {
+        Task(priority: .utility) {
+            let temporary = ChatSession(
+                container,
+                instructions: "Отвечай одним словом.",
+                generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+            )
+            _ = try? await temporary.respond(to: "Привет")
+        }
+    }
+
+    // MARK: - Сообщение, отправленное во время запуска модели
+
+    /// Пока модель запускается, сообщение можно написать: оно уйдёт само, когда всё будет готово.
+    func queue(_ text: String) {
+        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, queuedPrompt == nil else { return }
+        queuedPrompt = prompt
+    }
+
+    /// Отменяет ожидающее сообщение и возвращает его текст.
+    func takeQueued() -> String {
+        let text = queuedPrompt ?? ""
+        queuedPrompt = nil
+        return text
     }
 
     private func updateProgress(_ fraction: Double) {
@@ -167,6 +348,9 @@ final class ChatViewModel: ObservableObject {
     func unloadModel() {
         stop()
         saveCurrent()
+        loadAttempt = nil          // результат незавершённой загрузки будет отброшен
+        isLoadingModel = false
+        queuedPrompt = nil
         session = nil
         container = nil
         loadState = .idle
@@ -183,7 +367,7 @@ final class ChatViewModel: ObservableObject {
         return ChatSession(
             container,
             instructions: instructions,
-            generateParameters: GenerateParameters(maxTokens: 800, temperature: 0.6, topP: 0.9)
+            generateParameters: GenerateParameters(maxTokens: mode.maxTokens, temperature: 0.6, topP: 0.9)
         )
     }
 
@@ -203,6 +387,31 @@ final class ChatViewModel: ObservableObject {
         return result
     }
 
+    // MARK: - Свёрнутые сообщения
+
+    func isLong(_ message: ChatMessage) -> Bool {
+        let isUser = message.role == .user
+        if message.text.count > (isUser ? 500 : 1500) { return true }
+        let lines = message.text.reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
+        return lines > (isUser ? 8 : 40)
+    }
+
+    /// Сообщения пользователя по умолчанию свёрнуты, если они длинные.
+    /// Ответы ассистента по умолчанию развёрнуты, но их тоже можно свернуть.
+    func isCollapsed(_ message: ChatMessage, streaming: Bool) -> Bool {
+        guard !streaming, isLong(message) else { return false }
+        let toggled = toggledIDs.contains(message.id)
+        return message.role == .user ? !toggled : toggled
+    }
+
+    func toggleCollapse(_ id: UUID) {
+        if toggledIDs.contains(id) {
+            toggledIDs.remove(id)
+        } else {
+            toggledIDs.insert(id)
+        }
+    }
+
     // MARK: - Отправка сообщений
 
     func send(_ text: String) {
@@ -219,28 +428,36 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        // Пересобираем сессию, если диалог разросся или прошлая генерация была прервана.
+        // Пересобираем сессию, если диалог разросся, сменились настройки
+        // или прошлая генерация была прервана.
         if session == nil || sessionDirty || sessionChars > Self.sessionResetChars {
             session = makeSession(for: container, transcript: contextTranscript())
             sessionDirty = false
         }
         guard let session else { return }
 
+        let userMessage = ChatMessage(role: .user, text: prompt)
         let reply = ChatMessage(role: .assistant, text: "")
-        messages.append(ChatMessage(role: .user, text: prompt))
+        messages.append(userMessage)
         messages.append(reply)
+        // Экран прокручивается к вопросу, а не к концу ответа, поэтому не «прыгает».
+        scrollRequest = userMessage.id
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
         let replyID = reply.id
         let token = UUID()
         currentToken = token
         isGenerating = true
-        let isLong = prompt.count > Self.longTextThreshold
+        let isLongPrompt = prompt.count > Self.longTextThreshold
+        let interval = mode.uiInterval
 
         generationTask = Task {
             var finalPrompt = prompt
             var footnote = ""
+            var buffer = ""
+            var lastFlush = Date()
             do {
-                if isLong {
+                if isLongPrompt {
                     let prepared = try await prepareLongText(prompt, container: container, replyID: replyID)
                     finalPrompt = prepared.prompt
                     footnote = prepared.footnote
@@ -250,23 +467,50 @@ final class ChatViewModel: ObservableObject {
                 var produced = 0
                 for try await chunk in session.streamResponse(to: finalPrompt) {
                     if Task.isCancelled { break }
-                    append(chunk, to: replyID)
+                    buffer += chunk
                     produced += 1
+
+                    // Экран обновляется порциями: так интерфейс не лагает.
+                    let now = Date()
+                    if now.timeIntervalSince(lastFlush) >= interval {
+                        append(buffer, to: replyID)
+                        buffer = ""
+                        lastFlush = now
+                    }
+
                     if produced % 24 == 0, !hasEnoughMemory(minBytes: 120 * Self.mb) {
-                        append("\n\n⚠️ Не хватает памяти, ответ остановлен.", to: replyID)
+                        buffer += "\n\n⚠️ Не хватает памяти, ответ остановлен."
                         break
                     }
+                }
+                if !buffer.isEmpty {
+                    append(buffer, to: replyID)
+                    buffer = ""
                 }
                 if !footnote.isEmpty && !Task.isCancelled {
                     append(footnote, to: replyID)
                 }
             } catch {
+                if !buffer.isEmpty {
+                    append(buffer, to: replyID)
+                    buffer = ""
+                }
                 if !(error is CancellationError) {
-                    setText("⚠️ \(error.localizedDescription)", for: replyID)
+                    showError(error.localizedDescription, in: replyID)
                 }
             }
             finishGeneration(token: token, replyID: replyID, promptChars: finalPrompt.count)
         }
+    }
+
+    /// Генерирует ответ на последний вопрос заново.
+    func regenerate() {
+        guard !isGenerating, container != nil else { return }
+        guard let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        let prompt = messages[index].text
+        messages.removeSubrange(index...)
+        sessionDirty = true
+        send(prompt)
     }
 
     /// Останавливает генерацию. Вызывается и при сворачивании приложения:
@@ -305,6 +549,16 @@ final class ChatViewModel: ObservableObject {
         messages[index].text = text
     }
 
+    private func showError(_ message: String, in id: UUID) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        let current = messages[index].text
+        if current.isEmpty || current.hasPrefix("⏳") {
+            messages[index].text = "⚠️ " + message
+        } else {
+            messages[index].text += "\n\n⚠️ " + message
+        }
+    }
+
     // MARK: - Длинные тексты
 
     private struct PreparedPrompt {
@@ -321,6 +575,7 @@ final class ChatViewModel: ObservableObject {
         replyID: UUID
     ) async throws -> PreparedPrompt {
         let (instruction, body) = Self.splitInstruction(prompt)
+        let mode = self.mode
 
         var text = body
         var footnote = ""
@@ -329,13 +584,14 @@ final class ChatViewModel: ObservableObject {
             footnote = "\n\n_Текст очень длинный: обработаны только первые \(Self.maxLongTextChars) символов._"
         }
 
-        let chunks = Self.splitIntoChunks(text, size: Self.chunkSize)
+        let chunks = Self.splitIntoChunks(text, size: mode.chunkSize)
         var notes: [String] = []
         for (index, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
             guard hasEnoughMemory(minBytes: 300 * Self.mb) else { throw LongTextError.lowMemory }
             setText("⏳ Читаю длинный текст: часть \(index + 1) из \(chunks.count)…", for: replyID)
             notes.append(try await digest(chunk, container: container))
+            try await coolDown(mode)
         }
 
         // Если выжимок получилось слишком много, сжимаем их ещё раз.
@@ -348,6 +604,7 @@ final class ChatViewModel: ObservableObject {
                 guard hasEnoughMemory(minBytes: 300 * Self.mb) else { throw LongTextError.lowMemory }
                 setText("⏳ Сжимаю выжимки: шаг \(rounds + 1), часть \(index + 1) из \(groups.count)…", for: replyID)
                 notes.append(try await digest(group, container: container))
+                try await coolDown(mode)
             }
             rounds += 1
         }
@@ -361,6 +618,15 @@ final class ChatViewModel: ObservableObject {
             "Текст был слишком длинным, поэтому ниже его краткие выжимки по частям. " +
             "Опирайся только на них.\n\n\(joined)"
         return PreparedPrompt(prompt: final, footnote: footnote)
+    }
+
+    /// Пауза между частями: телефон успевает остыть, а интерфейс остаётся плавным.
+    private func coolDown(_ mode: PerformanceMode) async throws {
+        if mode.pauseSeconds > 0 {
+            try await Task.sleep(nanoseconds: UInt64(mode.pauseSeconds * 1_000_000_000))
+        } else {
+            await Task.yield()
+        }
     }
 
     /// Короткая выжимка одного фрагмента. Для каждой выжимки создаётся отдельная
@@ -499,6 +765,7 @@ final class ChatViewModel: ObservableObject {
         saveCurrent()
         messages = conversation.messages
         currentID = id
+        bottomRequest += 1
         if let container {
             session = makeSession(for: container, transcript: contextTranscript())
             sessionDirty = false
@@ -515,6 +782,19 @@ final class ChatViewModel: ObservableObject {
                 session = makeSession(for: container)
                 sessionDirty = false
             }
+        }
+        persist()
+    }
+
+    func deleteAllChats() {
+        stop()
+        conversations = []
+        messages = []
+        toggledIDs = []
+        currentID = UUID()
+        if let container {
+            session = makeSession(for: container)
+            sessionDirty = false
         }
         persist()
     }
