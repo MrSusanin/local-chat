@@ -22,55 +22,54 @@ final class CoreDataStack {
         messageEntity.name = "StoredMessage"
         messageEntity.managedObjectClassName = NSStringFromClass(NSManagedObject.self)
 
-        let messageIDAttribute = NSAttributeDescription.stringAttribute("messageID")
         let roleAttribute = NSAttributeDescription.stringAttribute("role")
         let textAttribute = NSAttributeDescription.stringAttribute("text")
+        let messageIdAttribute = NSAttributeDescription.stringAttribute("messageID")
         let positionAttribute = NSAttributeDescription.integerAttribute("position")
-
-        let messagesRelation = NSRelationshipDescription()
-        messagesRelation.name = "messages"
-        messagesRelation.destinationEntity = messageEntity
-        messagesRelation.minCount = 0
-        messagesRelation.maxCount = 0
-        messagesRelation.isToMany = true
-        messagesRelation.deleteRule = .cascadeDeleteRule
 
         let conversationRelation = NSRelationshipDescription()
         conversationRelation.name = "conversation"
         conversationRelation.destinationEntity = conversationEntity
         conversationRelation.minCount = 1
         conversationRelation.maxCount = 1
-        conversationRelation.isToMany = false
         conversationRelation.deleteRule = .nullifyDeleteRule
+
+        let messagesRelation = NSRelationshipDescription()
+        messagesRelation.name = "messages"
+        messagesRelation.destinationEntity = messageEntity
+        messagesRelation.minCount = 0
+        messagesRelation.maxCount = 0
+        messagesRelation.deleteRule = .cascadeDeleteRule
 
         messagesRelation.inverseRelationship = conversationRelation
         conversationRelation.inverseRelationship = messagesRelation
 
         conversationEntity.properties = [idAttribute, titleAttribute, updatedAtAttribute, messagesRelation]
-        messageEntity.properties = [messageIDAttribute, roleAttribute, textAttribute, positionAttribute, conversationRelation]
+        messageEntity.properties = [messageIdAttribute, roleAttribute, textAttribute, positionAttribute, conversationRelation]
+
         model.entities = [conversationEntity, messageEntity]
 
         container = NSPersistentContainer(name: "LocalChatModel", managedObjectModel: model)
-        let description = container.persistentStoreDescriptions.first
-        description?.shouldMigrateStoreAutomatically = true
-        description?.shouldInferMappingModelAutomatically = true
-
         container.loadPersistentStores { _, error in
             if let error {
-                // Avoid crashing in production; errors are surfaced through operations that fail.
-                NSLog("Core Data store failed to load: %@", error.localizedDescription)
+                assertionFailure("Core Data failed to load: \(error.localizedDescription)")
             }
         }
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
-        container.viewContext.undoManager = nil
     }
 
-    private var context: NSManagedObjectContext { container.viewContext }
+    var viewContext: NSManagedObjectContext { container.viewContext }
+
+    func saveContext() throws {
+        let context = container.viewContext
+        guard context.hasChanges else { return }
+        try context.save()
+    }
 
     func fetchConversations() throws -> [Conversation] {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
         request.sortDescriptors = [NSSortDescriptor(key: "updatedAt", ascending: false)]
-        return try context.fetch(request).compactMap(convert)
+        return try viewContext.fetch(request).compactMap(convert)
     }
 
     func saveConversation(_ conversation: Conversation) throws {
@@ -78,25 +77,30 @@ final class CoreDataStack {
         request.fetchLimit = 1
         request.predicate = NSPredicate(format: "id == %@", conversation.id.uuidString)
 
-        let stored = try context.fetch(request).first ?? NSEntityDescription.insertNewObject(
+        let stored = try viewContext.fetch(request).first ?? NSEntityDescription.insertNewObject(
             forEntityName: "StoredConversation",
-            into: context
+            into: viewContext
         )
+
         stored.setValue(conversation.id.uuidString, forKey: "id")
         stored.setValue(conversation.title, forKey: "title")
         stored.setValue(conversation.updatedAt, forKey: "updatedAt")
 
         let oldMessages = (stored.value(forKey: "messages") as? Set<NSManagedObject>) ?? []
-        oldMessages.forEach(context.delete)
+        oldMessages.forEach(viewContext.delete)
 
         for (index, message) in conversation.messages.enumerated() {
-            let row = NSEntityDescription.insertNewObject(forEntityName: "StoredMessage", into: context)
-            row.setValue(message.id.uuidString, forKey: "messageID")
-            row.setValue(message.role.rawValue, forKey: "role")
-            row.setValue(message.text, forKey: "text")
-            row.setValue(index, forKey: "position")
-            row.setValue(stored, forKey: "conversation")
+            let managedMessage = NSEntityDescription.insertNewObject(
+                forEntityName: "StoredMessage",
+                into: viewContext
+            )
+            managedMessage.setValue(message.id.uuidString, forKey: "messageID")
+            managedMessage.setValue(message.role.rawValue, forKey: "role")
+            managedMessage.setValue(message.text, forKey: "text")
+            managedMessage.setValue(index, forKey: "position")
+            managedMessage.setValue(stored, forKey: "conversation")
         }
+
         try saveContext()
     }
 
@@ -104,50 +108,45 @@ final class CoreDataStack {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
         request.fetchLimit = 1
         request.predicate = NSPredicate(format: "id == %@", id.uuidString)
-        if let row = try context.fetch(request).first {
-            context.delete(row)
+        if let row = try viewContext.fetch(request).first {
+            viewContext.delete(row)
             try saveContext()
         }
     }
 
     func deleteAllConversations() throws {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
-        try context.fetch(request).forEach(context.delete)
+        try viewContext.fetch(request).forEach(viewContext.delete)
         try saveContext()
-    }
-
-    func saveContext() throws {
-        guard context.hasChanges else { return }
-        try context.save()
     }
 
     private func convert(_ object: NSManagedObject) -> Conversation? {
         guard
-            let rawID = object.value(forKey: "id") as? String,
-            let id = UUID(uuidString: rawID),
+            let idValue = object.value(forKey: "id") as? String,
+            let uuid = UUID(uuidString: idValue),
             let title = object.value(forKey: "title") as? String,
-            let updatedAt = object.value(forKey: "updatedAt") as? Date
+            let updatedAt = object.value(forKey: "updatedAt") as? Date,
+            let rawMessages = object.value(forKey: "messages") as? Set<NSManagedObject>
         else { return nil }
 
-        let rows = (object.value(forKey: "messages") as? Set<NSManagedObject>) ?? []
-        let messages = rows.compactMap { row -> (Int, ChatMessage)? in
+        let messages = rawMessages.compactMap { messageObject -> (Int, ChatMessage)? in
             guard
-                let rawMessageID = row.value(forKey: "messageID") as? String,
-                let messageID = UUID(uuidString: rawMessageID),
-                let rawRole = row.value(forKey: "role") as? String,
-                let role = ChatMessage.Role(rawValue: rawRole),
-                let text = row.value(forKey: "text") as? String
+                let rawId = messageObject.value(forKey: "messageID") as? String,
+                let messageID = UUID(uuidString: rawId),
+                let roleValue = messageObject.value(forKey: "role") as? String,
+                let role = ChatMessage.Role(rawValue: roleValue),
+                let text = messageObject.value(forKey: "text") as? String
             else { return nil }
 
             var message = ChatMessage(role: role, text: text)
             message.id = messageID
-            let position = (row.value(forKey: "position") as? NSNumber)?.intValue ?? 0
+            let position = (messageObject.value(forKey: "position") as? NSNumber)?.intValue ?? 0
             return (position, message)
         }
         .sorted { $0.0 < $1.0 }
         .map(\.1)
 
-        return Conversation(id: id, title: title, updatedAt: updatedAt, messages: messages)
+        return Conversation(id: uuid, title: title, updatedAt: updatedAt, messages: messages)
     }
 }
 
