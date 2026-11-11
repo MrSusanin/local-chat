@@ -1,5 +1,6 @@
 import Foundation
 
+// Keep this list aligned with the operations actually implemented by AIProviderClient.
 enum AIProvider: String, CaseIterable, Identifiable {
     case local
     case openAI = "openai"
@@ -19,7 +20,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
 
     var defaultModelName: String {
         switch self {
-        case .local: return "Qwen 2.5 1.5B"
+        case .local: return "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
         case .openAI: return "gpt-4o-mini"
         case .gemini: return "gemini-2.0-flash"
         case .groq: return "llama-3.1-8b-instant"
@@ -28,9 +29,9 @@ enum AIProvider: String, CaseIterable, Identifiable {
 
     var supportedCapabilities: [ModelCapability] {
         switch self {
-        case .local: return [.text, .image, .audio, .document]
+        case .local: return [.text]
         case .openAI: return [.text, .image]
-        case .gemini: return [.text, .image, .audio]
+        case .gemini: return [.text, .image]
         case .groq: return [.text]
         }
     }
