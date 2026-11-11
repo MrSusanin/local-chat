@@ -26,7 +26,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: aiChat
+        CFBundleDisplayName: LocalChat
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
