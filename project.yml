@@ -1,28 +1,39 @@
-name: Calculator
+name: LocalChat
 options:
   bundleIdPrefix: com.example
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "17.0"
+packages:
+  MLXLM:
+    url: https://github.com/ml-explore/mlx-swift-lm
+    minorVersion: 2.30.3
 settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
 targets:
-  Calculator:
+  LocalChat:
     type: application
     platform: iOS
     sources:
       - Sources
+    dependencies:
+      - package: MLXLM
+        product: MLXLLM
+      - package: MLXLM
+        product: MLXLMCommon
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: Калькулятор
+        CFBundleDisplayName: Локальный чат
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.calculator
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.localchat
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
