@@ -2,10 +2,17 @@ import SwiftUI
 
 @main
 struct LocalChatApp: App {
+    @StateObject private var appState = AppSessionStore()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .preferredColorScheme(.dark)
+            if appState.isAuthenticated {
+                ContentView()
+                    .preferredColorScheme(.dark)
+            } else {
+                LoginView(appState: appState)
+                    .preferredColorScheme(.dark)
+            }
         }
     }
 }
