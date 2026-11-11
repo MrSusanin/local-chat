@@ -68,23 +68,65 @@ final class ChatViewModel: ObservableObject {
     // Пороговые значения (в символах). Подобраны для iPhone с 4 ГБ памяти.
     private static let longTextThreshold = 3000      // выше этого текст обрабатывается по частям
     private static let maxLongTextChars = 60_000     // больше не читаем
-    private static let chunkSize = 2500              // размер одной части
     private static let notesLimit = 6000             // максимум выжимок, которые отдаём в финальный запрос
     private static let sessionResetChars = 6000      // после этого объёма диалога контекст пересобирается
     private static let mb = 1_048_576
     private static let writeQueue = DispatchQueue(label: "localchat.store", qos: .utility)
 
-    private let systemPrompt =
-        "Ты дружелюбный и полезный ассистент. Отвечай на том языке, на котором пишет пользователь. " +
-        "Отвечай кратко и по делу. Если не знаешь ответа, так и скажи."
+    // MARK: Состояние
 
     @Published var messages: [ChatMessage] = []
     @Published private(set) var conversations: [Conversation] = []
     @Published private(set) var currentID = UUID()
     @Published var loadState: LoadState
     @Published var selectedModelID: String
+    @Published private(set) var thermalHot = false
     @Published private(set) var isGenerating = false {
         didSet { UIApplication.shared.isIdleTimerDisabled = isGenerating }
+    }
+
+    // MARK: Настройки (сохраняются на телефоне)
+
+    @Published var performanceMode: PerformanceMode {
+        didSet {
+            UserDefaults.standard.set(performanceMode.rawValue, forKey: "performanceMode")
+            sessionDirty = true
+        }
+    }
+    @Published var autoEco: Bool {
+        didSet {
+            UserDefaults.standard.set(autoEco, forKey: "autoEco")
+            sessionDirty = true
+        }
+    }
+    @Published var answerStyle: AnswerStyle {
+        didSet {
+            UserDefaults.standard.set(answerStyle.rawValue, forKey: "answerStyle")
+            sessionDirty = true
+        }
+    }
+    @Published var customInstructions: String {
+        didSet {
+            UserDefaults.standard.set(customInstructions, forKey: "customInstructions")
+            sessionDirty = true
+        }
+    }
+
+    /// С включённым энергосбережением iOS автоматически работаем в щадящем режиме.
+    private var effectiveMode: PerformanceMode {
+        if autoEco && ProcessInfo.processInfo.isLowPowerModeEnabled { return .smooth }
+        return performanceMode
+    }
+
+    private var systemPrompt: String {
+        var prompt = "Ты дружелюбный и полезный ассистент. Отвечай на том языке, на котором пишет пользователь. "
+        prompt += answerStyle.instruction
+        prompt += " Если не знаешь ответа, так и скажи."
+        let custom = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !custom.isEmpty {
+            prompt += "\n\nДополнительные инструкции пользователя: " + custom
+        }
+        return prompt
     }
 
     private var container: ModelContainer?
@@ -94,6 +136,7 @@ final class ChatViewModel: ObservableObject {
     private var isLoadingModel = false
     private var generationTask: Task<Void, Never>?
     private var currentToken: UUID?
+    private var thermalObserver: NSObjectProtocol?
     private let storeURL: URL
 
     init() {
@@ -104,11 +147,30 @@ final class ChatViewModel: ObservableObject {
         loadState = defaults.bool(forKey: "downloaded.\(id)") ? .starting : .idle
         storeURL = Self.makeStoreURL()
 
+        performanceMode = PerformanceMode(rawValue: defaults.string(forKey: "performanceMode") ?? "") ?? .balanced
+        autoEco = defaults.object(forKey: "autoEco") as? Bool ?? true
+        answerStyle = AnswerStyle(rawValue: defaults.string(forKey: "answerStyle") ?? "") ?? .normal
+        customInstructions = defaults.string(forKey: "customInstructions") ?? ""
+
         conversations = Self.readConversations(from: storeURL)
         if let last = conversations.first {
             currentID = last.id
             messages = last.messages
         }
+
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.updateThermal() }
+        }
+        updateThermal()
+    }
+
+    private func updateThermal() {
+        thermalHot = ProcessInfo.processInfo.thermalState.rawValue
+            >= ProcessInfo.ThermalState.serious.rawValue
     }
 
     // MARK: - Модель
@@ -183,7 +245,11 @@ final class ChatViewModel: ObservableObject {
         return ChatSession(
             container,
             instructions: instructions,
-            generateParameters: GenerateParameters(maxTokens: 800, temperature: 0.6, topP: 0.9)
+            generateParameters: GenerateParameters(
+                maxTokens: effectiveMode.maxTokens,
+                temperature: 0.6,
+                topP: 0.9
+            )
         )
     }
 
@@ -219,7 +285,8 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        // Пересобираем сессию, если диалог разросся или прошлая генерация была прервана.
+        // Пересобираем сессию, если диалог разросся, сменились настройки
+        // или прошлая генерация была прервана.
         if session == nil || sessionDirty || sessionChars > Self.sessionResetChars {
             session = makeSession(for: container, transcript: contextTranscript())
             sessionDirty = false
@@ -234,6 +301,9 @@ final class ChatViewModel: ObservableObject {
         let token = UUID()
         currentToken = token
         isGenerating = true
+
+        let mode = effectiveMode
+        let flushInterval = mode.uiFlushInterval * (thermalHot ? 2 : 1)
         let isLong = prompt.count > Self.longTextThreshold
 
         generationTask = Task {
@@ -241,21 +311,40 @@ final class ChatViewModel: ObservableObject {
             var footnote = ""
             do {
                 if isLong {
-                    let prepared = try await prepareLongText(prompt, container: container, replyID: replyID)
+                    let prepared = try await prepareLongText(
+                        prompt, container: container, replyID: replyID, mode: mode
+                    )
                     finalPrompt = prepared.prompt
                     footnote = prepared.footnote
                     setText("", for: replyID)
                 }
 
+                // Текст на экране обновляется пачками, а не на каждое слово:
+                // так интерфейс не лагает, особенно в режиме «Плавно».
+                var buffer = ""
+                var lastFlush = Date.distantPast
                 var produced = 0
+                var lowMemory = false
+
                 for try await chunk in session.streamResponse(to: finalPrompt) {
                     if Task.isCancelled { break }
-                    append(chunk, to: replyID)
+                    buffer += chunk
                     produced += 1
+
+                    let now = Date()
+                    if now.timeIntervalSince(lastFlush) >= flushInterval {
+                        append(buffer, to: replyID)
+                        buffer = ""
+                        lastFlush = now
+                    }
                     if produced % 24 == 0, !hasEnoughMemory(minBytes: 120 * Self.mb) {
-                        append("\n\n⚠️ Не хватает памяти, ответ остановлен.", to: replyID)
+                        lowMemory = true
                         break
                     }
+                }
+                if !buffer.isEmpty { append(buffer, to: replyID) }
+                if lowMemory {
+                    append("\n\n⚠️ Не хватает памяти, ответ остановлен.", to: replyID)
                 }
                 if !footnote.isEmpty && !Task.isCancelled {
                     append(footnote, to: replyID)
@@ -267,6 +356,16 @@ final class ChatViewModel: ObservableObject {
             }
             finishGeneration(token: token, replyID: replyID, promptChars: finalPrompt.count)
         }
+    }
+
+    /// Повторить последний ответ: убираем его и отправляем последний вопрос заново.
+    func regenerate() {
+        guard !isGenerating,
+              let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        let prompt = messages[index].text
+        messages.removeSubrange(index...)
+        sessionDirty = true
+        send(prompt)
     }
 
     /// Останавливает генерацию. Вызывается и при сворачивании приложения:
@@ -291,6 +390,7 @@ final class ChatViewModel: ObservableObject {
         if currentToken == token {
             isGenerating = false
             currentToken = nil
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
         }
         saveCurrent()
     }
@@ -318,7 +418,8 @@ final class ChatViewModel: ObservableObject {
     private func prepareLongText(
         _ prompt: String,
         container: ModelContainer,
-        replyID: UUID
+        replyID: UUID,
+        mode: PerformanceMode
     ) async throws -> PreparedPrompt {
         let (instruction, body) = Self.splitInstruction(prompt)
 
@@ -329,13 +430,17 @@ final class ChatViewModel: ObservableObject {
             footnote = "\n\n_Текст очень длинный: обработаны только первые \(Self.maxLongTextChars) символов._"
         }
 
-        let chunks = Self.splitIntoChunks(text, size: Self.chunkSize)
+        let chunks = Self.splitIntoChunks(text, size: mode.chunkSize)
         var notes: [String] = []
         for (index, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
             guard hasEnoughMemory(minBytes: 300 * Self.mb) else { throw LongTextError.lowMemory }
+            try await coolDownIfNeeded(replyID: replyID)
             setText("⏳ Читаю длинный текст: часть \(index + 1) из \(chunks.count)…", for: replyID)
-            notes.append(try await digest(chunk, container: container))
+            notes.append(try await digest(chunk, container: container, mode: mode))
+            if mode.cooldown > 0 {
+                try await Task.sleep(nanoseconds: UInt64(mode.cooldown * 1_000_000_000))
+            }
         }
 
         // Если выжимок получилось слишком много, сжимаем их ещё раз.
@@ -346,8 +451,12 @@ final class ChatViewModel: ObservableObject {
             for (index, group) in groups.enumerated() {
                 try Task.checkCancellation()
                 guard hasEnoughMemory(minBytes: 300 * Self.mb) else { throw LongTextError.lowMemory }
+                try await coolDownIfNeeded(replyID: replyID)
                 setText("⏳ Сжимаю выжимки: шаг \(rounds + 1), часть \(index + 1) из \(groups.count)…", for: replyID)
-                notes.append(try await digest(group, container: container))
+                notes.append(try await digest(group, container: container, mode: mode))
+                if mode.cooldown > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(mode.cooldown * 1_000_000_000))
+                }
             }
             rounds += 1
         }
@@ -363,13 +472,24 @@ final class ChatViewModel: ObservableObject {
         return PreparedPrompt(prompt: final, footnote: footnote)
     }
 
+    /// Если телефон сильно нагрелся, делаем паузу, чтобы он остыл (до минуты).
+    private func coolDownIfNeeded(replyID: UUID) async throws {
+        var waited = 0
+        while thermalHot && waited < 12 {
+            try Task.checkCancellation()
+            setText("⏳ Телефон нагрелся, даю ему немного остыть…", for: replyID)
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            waited += 1
+        }
+    }
+
     /// Короткая выжимка одного фрагмента. Для каждой выжимки создаётся отдельная
     /// временная сессия, чтобы контекст не накапливался.
-    private func digest(_ text: String, container: ModelContainer) async throws -> String {
+    private func digest(_ text: String, container: ModelContainer, mode: PerformanceMode) async throws -> String {
         let temporary = ChatSession(
             container,
             instructions: "Ты точный помощник. Делаешь краткие выжимки текста, ничего не выдумывая.",
-            generateParameters: GenerateParameters(maxTokens: 200, temperature: 0.3, topP: 0.9)
+            generateParameters: GenerateParameters(maxTokens: mode.digestTokens, temperature: 0.3, topP: 0.9)
         )
         let answer = try await temporary.respond(
             to: "Сделай краткую выжимку фрагмента ниже в 3-5 предложениях на языке фрагмента. " +
@@ -515,6 +635,18 @@ final class ChatViewModel: ObservableObject {
                 session = makeSession(for: container)
                 sessionDirty = false
             }
+        }
+        persist()
+    }
+
+    func deleteAllChats() {
+        stop()
+        conversations = []
+        messages = []
+        currentID = UUID()
+        if let container {
+            session = makeSession(for: container)
+            sessionDirty = false
         }
         persist()
     }
