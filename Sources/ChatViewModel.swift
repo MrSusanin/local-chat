@@ -12,6 +12,31 @@ struct ChatMessage: Identifiable, Equatable, Codable {
     var id = UUID()
     let role: Role
     var text: String
+    var attachments: [ChatAttachment] = []
+
+    init(role: Role, text: String, attachments: [ChatAttachment] = []) {
+        self.init(id: UUID(), role: role, text: text, attachments: attachments)
+    }
+
+    init(id: UUID, role: Role, text: String, attachments: [ChatAttachment] = []) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.attachments = attachments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, role, text, attachments
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        role = try container.decode(Role.self, forKey: .role)
+        text = try container.decode(String.self, forKey: .text)
+        // Старые чаты (до появления вложений) продолжают читаться.
+        attachments = try container.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? []
+    }
 }
 
 struct Conversation: Identifiable, Codable, Equatable {
@@ -19,12 +44,6 @@ struct Conversation: Identifiable, Codable, Equatable {
     var title: String
     var updatedAt: Date
     var messages: [ChatMessage]
-}
-
-struct ModelOption: Identifiable, Hashable {
-    let id: String        // идентификатор репозитория на Hugging Face
-    let title: String
-    let detail: String
 }
 
 enum LoadState: Equatable {
@@ -110,41 +129,85 @@ private enum LongTextError: LocalizedError {
 
 @MainActor
 final class ChatViewModel: ObservableObject {
-    static let models: [ModelOption] = [
-        ModelOption(
-            id: "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
-            title: "Qwen 2.5 · 1.5B (рекомендуется)",
-            detail: "Около 1 ГБ. Умнее, лучше понимает русский."
-        ),
-        ModelOption(
-            id: "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-            title: "Qwen 2.5 · 0.5B (быстрая)",
-            detail: "Около 0,4 ГБ. Очень быстрая, но отвечает проще."
-        ),
-        ModelOption(
-            id: "mlx-community/Llama-3.2-1B-Instruct-4bit",
-            title: "Llama 3.2 · 1B",
-            detail: "Около 0,7 ГБ. Лучше всего говорит по-английски."
-        )
-    ]
 
-    // Пороговые значения (в символах). Подобраны для iPhone с 4 ГБ памяти.
-    private static let longTextThreshold = 3000      // выше этого текст обрабатывается по частям
-    private static let maxLongTextChars = 60_000     // больше не читаем
-    private static let notesLimit = 6000             // максимум выжимок, которые отдаём в финальный запрос
-    private static let sessionResetChars = 6000      // после этого объёма диалога контекст пересобирается
-    private static let mb = 1_048_576
-    private static let writeQueue = DispatchQueue(label: "localchat.store", qos: .utility)
+    // MARK: Провайдер и модели
 
-    private let baseSystemPrompt =
-        "Ты дружелюбный и полезный ассистент. Отвечай на том языке, на котором пишет пользователь. " +
-        "Отвечай кратко и по делу. Если не знаешь ответа, так и скажи."
+    /// Активный ИИ: локальная модель или облако (OpenAI, Gemini, Groq).
+    @Published var provider: AIProvider {
+        didSet {
+            guard oldValue != provider else { return }
+            UserDefaults.standard.set(provider.rawValue, forKey: "selectedProvider")
+            queuedPrompt = nil
+            // Контекст диалога пересоберётся под нового ИИ.
+            sessionDirty = true
+        }
+    }
+
+    /// Выбранная модель для каждого провайдера (запоминается отдельно).
+    @Published private(set) var selectedModelByProvider: [AIProvider: String] = [:]
+
+    /// API ключи провайдеров — в связке ключей, не в настройках приложения.
+    @Published private(set) var apiKeyByProvider: [AIProvider: String] = [:]
+
+    /// Пользователь явно открыл экран выбора ИИ и модели.
+    @Published var showsModelSetup = false
+
+    /// Имя активной модели (для локальной — репозиторий на Hugging Face).
+    var modelName: String {
+        selectedModelByProvider[provider] ?? provider.defaultModelName
+    }
+
+    var hasAPIKey: Bool {
+        !(apiKeyByProvider[provider] ?? "").isEmpty
+    }
+
+    /// Возможности активной модели: по ним появляются кнопки «фото», «аудио» и т.д.
+    var capabilities: Set<ModelCapability> {
+        provider.models.first { $0.name == modelName }?.capabilities ?? [.text]
+    }
+
+    func supports(_ capability: ModelCapability) -> Bool {
+        capabilities.contains(capability)
+    }
+
+    var modelDisplayName: String {
+        provider.models.first { $0.name == modelName }?.title ?? modelName
+    }
+
+    /// Выбранная локальная модель (нужна экрану загрузки).
+    var selectedLocalModel: AIModelOption? {
+        AIProvider.local.models.first { $0.name == selectedModelByProvider[.local] }
+    }
+
+    /// Можно ли закрыть экран выбора ИИ и вернуться в чат.
+    var canCloseModelSetup: Bool {
+        if provider != .local { return true }
+        if case .ready = loadState { return true }
+        return false
+    }
+
+    func selectModel(_ name: String, for provider: AIProvider) {
+        selectedModelByProvider[provider] = name
+        UserDefaults.standard.set(name, forKey: "selectedModel.\(provider.rawValue)")
+        sessionDirty = true
+    }
+
+    func apiKey(for provider: AIProvider) -> String {
+        apiKeyByProvider[provider] ?? ""
+    }
+
+    /// Пустой ключ удаляется из связки ключей.
+    func updateAPIKey(_ key: String, for provider: AIProvider) {
+        apiKeyByProvider[provider] = key
+        try? KeychainStore.write(key, account: "apikey.\(provider.rawValue)")
+    }
+
+    // MARK: Состояние
 
     @Published var messages: [ChatMessage] = []
     @Published private(set) var conversations: [Conversation] = []
     @Published private(set) var currentID = UUID()
     @Published var loadState: LoadState
-    @Published var selectedModelID: String
     @Published private(set) var isGenerating = false {
         didSet { UIApplication.shared.isIdleTimerDisabled = isGenerating }
     }
@@ -175,7 +238,7 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var scrollRequest: UUID?
     @Published private(set) var bottomRequest = 0
 
-    /// Сообщение, написанное, пока модель ещё запускалась.
+    /// Сообщение, написанное, пока локальная модель ещё запускалась.
     @Published private(set) var queuedPrompt: String?
 
     private var loadAttempt: UUID?
@@ -184,22 +247,55 @@ final class ChatViewModel: ObservableObject {
     private var sessionChars = 0
     private var sessionDirty = false
     private var isLoadingModel = false
+    private var loadedModelID: String?
     private var generationTask: Task<Void, Never>?
     private var currentToken: UUID?
-    private let storeURL: URL
+
+    // Пороговые значения (в символах). Подобраны для iPhone с 4 ГБ памяти.
+    private static let longTextThreshold = 3000      // выше этого текст обрабатывается по частям
+    private static let maxLongTextChars = 60_000     // больше не читаем
+    private static let notesLimit = 6000             // максимум выжимок, которые отдаём в финальный запрос
+    private static let sessionResetChars = 6000      // после этого объёма диалога контекст пересобирается
+    private static let mb = 1_048_576
+
+    private let baseSystemPrompt =
+        "Ты дружелюбный и полезный ассистент. Отвечай на том языке, на котором пишет пользователь. " +
+        "Отвечай кратко и по делу. Если не знаешь ответа, так и скажи."
 
     init() {
         let defaults = UserDefaults.standard
-        let id = defaults.string(forKey: "selectedModel") ?? Self.models[0].id
-        selectedModelID = id
-        // Если модель уже скачана, сразу показываем «запуск», а не экран выбора.
-        loadState = defaults.bool(forKey: "downloaded.\(id)") ? .starting : .idle
-        storeURL = Self.makeStoreURL()
+
+        // Провайдер (по умолчанию — локальная модель).
+        let providerRaw = defaults.string(forKey: "selectedProvider") ?? AIProvider.local.rawValue
+        provider = AIProvider(rawValue: providerRaw) ?? .local
+
+        // Выбранные модели и ключи.
+        var models: [AIProvider: String] = [:]
+        var keys: [AIProvider: String] = [:]
+        for item in AIProvider.allCases {
+            models[item] = defaults.string(forKey: "selectedModel.\(item.rawValue)") ?? item.defaultModelName
+            keys[item] = (try? KeychainStore.read(account: "apikey.\(item.rawValue)")) ?? ""
+        }
+        // Переносим имя локальной модели из прежнего ключа.
+        if models[.local] == AIProvider.local.defaultModelName,
+           let legacy = defaults.string(forKey: "selectedModel"),
+           AIProvider.local.models.contains(where: { $0.name == legacy }) {
+            models[.local] = legacy
+            defaults.set(legacy, forKey: "selectedModel.\(AIProvider.local.rawValue)")
+        }
+        selectedModelByProvider = models
+        apiKeyByProvider = keys
+
+        // Локальная модель: если она уже скачана, сразу показываем «запуск».
+        let localID = models[.local] ?? AIProvider.local.defaultModelName
+        loadState = (provider == .local && defaults.bool(forKey: "downloaded.\(localID)")) ? .starting : .idle
 
         mode = PerformanceMode(rawValue: defaults.string(forKey: "perfMode") ?? "") ?? .balanced
         customInstructions = defaults.string(forKey: "customInstructions") ?? ""
 
-        conversations = Self.readConversations(from: storeURL)
+        // Чаты: Core Data + одноразовый перенос из старого JSON-хранилища.
+        CoreDataStack.shared.migrateLegacyStoreIfNeeded()
+        conversations = CoreDataStack.shared.fetchConversations()
         if let last = conversations.first {
             currentID = last.id
             messages = last.messages
@@ -215,26 +311,54 @@ final class ChatViewModel: ObservableObject {
         return prompt
     }
 
-    // MARK: - Модель
+    // MARK: - Локальная модель
 
     func autoLoadIfPossible() {
-        if case .starting = loadState { loadModel() }
+        guard provider == .local, case .starting = loadState else { return }
+        loadModel()
+    }
+
+    /// Открывает экран выбора ИИ (модель, провайдер, API ключ).
+    func openModelSetup() {
+        stop()
+        saveCurrent()
+        showsModelSetup = true
+    }
+
+    /// Закрывает экран выбора ИИ и возвращает в чат.
+    func closeModelSetup() {
+        showsModelSetup = false
     }
 
     func loadModel() {
-        guard !isLoadingModel else { return }
+        guard provider == .local, !isLoadingModel else { return }
+        let id = modelName     // репозиторий Hugging Face
+        if case .ready = loadState, let loadedModelID, loadedModelID == id {
+            // Эта модель уже в памяти — просто возвращаемся в чат.
+            showsModelSetup = false
+            return
+        }
+
         isLoadingModel = true
         let attempt = UUID()
         loadAttempt = attempt
+        showsModelSetup = false
+        selectedModelByProvider[.local] = id
+        UserDefaults.standard.set(id, forKey: "selectedModel.\(AIProvider.local.rawValue)")
 
-        let id = selectedModelID
+        // Выгружаем прежнюю модель, чтобы не держать в памяти две сразу.
+        if let loadedModelID, loadedModelID != id {
+            session = nil
+            container = nil
+            sessionDirty = true
+        }
+
         let defaults = UserDefaults.standard
-        defaults.set(id, forKey: "selectedModel")
         let wasDownloaded = defaults.bool(forKey: "downloaded.\(id)")
         loadState = wasDownloaded ? .starting : .downloading(0)
         // Если модель уже скачана, читаем её прямо из папки на телефоне
         // и не обращаемся к Hugging Face при каждом запуске.
-        let localURL = wasDownloaded ? Self.localModelURL(for: id) : nil
+        let localURL = wasDownloaded ? Self.localModelURL(for: id) else nil
 
         Task {
             do {
@@ -243,6 +367,7 @@ final class ChatViewModel: ObservableObject {
                 container = loaded
                 session = makeSession(for: loaded, transcript: contextTranscript())
                 sessionDirty = false
+                loadedModelID = id
                 defaults.set(true, forKey: "downloaded.\(id)")
                 loadState = .ready
                 isLoadingModel = false
@@ -316,22 +441,6 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Сообщение, отправленное во время запуска модели
-
-    /// Пока модель запускается, сообщение можно написать: оно уйдёт само, когда всё будет готово.
-    func queue(_ text: String) {
-        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty, queuedPrompt == nil else { return }
-        queuedPrompt = prompt
-    }
-
-    /// Отменяет ожидающее сообщение и возвращает его текст.
-    func takeQueued() -> String {
-        let text = queuedPrompt ?? ""
-        queuedPrompt = nil
-        return text
-    }
-
     private func updateProgress(_ fraction: Double) {
         let value = min(max(fraction, 0), 1)
         switch loadState {
@@ -353,6 +462,7 @@ final class ChatViewModel: ObservableObject {
         queuedPrompt = nil
         session = nil
         container = nil
+        loadedModelID = nil
         loadState = .idle
     }
 
@@ -387,6 +497,22 @@ final class ChatViewModel: ObservableObject {
         return result
     }
 
+    // MARK: - Сообщение, отправленное во время запуска модели
+
+    /// Пока локальная модель запускается, сообщение можно написать: оно уйдёт само, когда всё будет готово.
+    func queue(_ text: String) {
+        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, queuedPrompt == nil else { return }
+        queuedPrompt = prompt
+    }
+
+    /// Отменяет ожидающее сообщение и возвращает его текст.
+    func takeQueued() -> String {
+        let text = queuedPrompt ?? ""
+        queuedPrompt = nil
+        return text
+    }
+
     // MARK: - Свёрнутые сообщения
 
     func isLong(_ message: ChatMessage) -> Bool {
@@ -414,9 +540,62 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Отправка сообщений
 
-    func send(_ text: String) {
+    /// Отправляет сообщение активному ИИ. Вместе с текстом можно передать вложения
+    /// (фото, аудио, документ) — их поймут только облачные модели, которые их поддерживают.
+    func send(_ text: String, attachments: [PendingAttachment] = []) {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty, !isGenerating, let container else { return }
+        guard !prompt.isEmpty || !attachments.isEmpty else { return }
+        guard !isGenerating else { return }
+
+        switch provider {
+        case .local:
+            sendLocal(prompt)
+        default:
+            sendRemote(prompt, attachments: attachments)
+        }
+    }
+
+    /// Генерирует ответ на последний вопрос заново.
+    func regenerate() {
+        guard !isGenerating, let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        let prompt = messages[index].text
+        let attachments = messages[index].attachments
+        messages.removeSubrange(index...)
+        sessionDirty = true
+
+        // Вложения из прошлого вопроса переиспользуем (файлы уже на диске).
+        let pending = attachments.compactMap { attachment -> PendingAttachment? in
+            guard let data = AttachmentStore.data(forStoredName: attachment.storedName),
+                  !data.isEmpty,
+                  data.count <= PendingAttachment.maxSize else { return nil }
+            return PendingAttachment(
+                kind: attachment.kind,
+                fileName: attachment.fileName,
+                mimeType: Self.mimeType(for: attachment),
+                data: data,
+                existingStoredName: attachment.storedName
+            )
+        }
+        send(prompt, attachments: pending)
+    }
+
+    /// Останавливает генерацию. Вызывается и при сворачивании приложения:
+    /// iOS не разрешает приложению считать на GPU в фоне.
+    func stop() {
+        if isGenerating { sessionDirty = true }
+        generationTask?.cancel()
+        generationTask = nil
+        currentToken = nil
+        isGenerating = false
+    }
+
+    // MARK: Локальная генерация (MLX)
+
+    private func sendLocal(_ prompt: String) {
+        guard let container else {
+            queue(prompt)
+            return
+        }
 
         guard hasEnoughMemory(minBytes: 250 * Self.mb) else {
             messages.append(ChatMessage(role: .user, text: prompt))
@@ -503,25 +682,178 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Генерирует ответ на последний вопрос заново.
-    func regenerate() {
-        guard !isGenerating, container != nil else { return }
-        guard let index = messages.lastIndex(where: { $0.role == .user }) else { return }
-        let prompt = messages[index].text
-        messages.removeSubrange(index...)
-        sessionDirty = true
-        send(prompt)
+    // MARK: Облачная генерация (OpenAI, Gemini, Groq)
+
+    private func sendRemote(_ prompt: String, attachments: [PendingAttachment]) {
+        guard let client = AIProviderClientFactory.client(provider: provider, modelName: modelName) else { return }
+
+        let key = apiKey(for: provider)
+        guard !key.isEmpty else {
+            messages.append(ChatMessage(role: .user, text: prompt))
+            messages.append(ChatMessage(
+                role: .assistant,
+                text: "⚠️ Для \(provider.title) нужен API ключ. Откройте «Сменить ИИ / модель» и введите ключ."
+            ))
+            saveCurrent()
+            return
+        }
+
+        // Сохраняем вложения в файлы и собираем данные для запроса.
+        var stored: [ChatAttachment] = []
+        var payloads: [AttachmentPayload] = []
+        for pending in attachments {
+            let storedName: String?
+            if let existing = pending.existingStoredName,
+               FileManager.default.fileExists(atPath: AttachmentStore.url(forStoredName: existing).path) {
+                storedName = existing
+            } else {
+                storedName = AttachmentStore.save(data: pending.data, fileName: pending.fileName)
+            }
+            guard let storedName else { continue }
+            stored.append(ChatAttachment(fileName: pending.fileName, storedName: storedName, kind: pending.kind))
+            payloads.append(AttachmentPayload(
+                kind: pending.kind.capability,
+                mimeType: pending.mimeType,
+                fileName: pending.fileName,
+                data: pending.data
+            ))
+        }
+
+        let history = remoteHistory()
+
+        let userMessage = ChatMessage(role: .user, text: prompt, attachments: stored)
+        let reply = ChatMessage(role: .assistant, text: "")
+        messages.append(userMessage)
+        messages.append(reply)
+        scrollRequest = userMessage.id
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+        let replyID = reply.id
+        let token = UUID()
+        currentToken = token
+        isGenerating = true
+        let interval = mode.uiInterval
+
+        let request = ProviderRequest(
+            systemPrompt: systemPrompt,
+            history: history,
+            userMessage: ProviderMessage(role: .user, text: prompt, attachments: payloads),
+            maxTokens: mode.maxTokens
+        )
+
+        generationTask = Task {
+            var buffer = ""
+            var lastFlush = Date()
+            var received = false
+            do {
+                for try await chunk in client.stream(request, apiKey: key) {
+                    if Task.isCancelled { break }
+                    received = true
+                    buffer += chunk
+                    let now = Date()
+                    if now.timeIntervalSince(lastFlush) >= interval {
+                        append(buffer, to: replyID)
+                        buffer = ""
+                        lastFlush = now
+                    }
+                }
+                if !buffer.isEmpty {
+                    append(buffer, to: replyID)
+                    buffer = ""
+                }
+                if !received && !Task.isCancelled {
+                    showError("Пустой ответ от \(provider.title). Попробуйте ещё раз.", in: replyID)
+                }
+            } catch {
+                if !buffer.isEmpty {
+                    append(buffer, to: replyID)
+                    buffer = ""
+                }
+                if !Self.isCancellation(error) {
+                    showError(Self.describe(error), in: replyID)
+                }
+            }
+            finishGeneration(token: token, replyID: replyID, promptChars: prompt.count)
+        }
     }
 
-    /// Останавливает генерацию. Вызывается и при сворачивании приложения:
-    /// iOS не разрешает приложению считать на GPU в фоне.
-    func stop() {
-        if isGenerating { sessionDirty = true }
-        generationTask?.cancel()
-        generationTask = nil
-        currentToken = nil
-        isGenerating = false
+    /// Последние сообщения для облачного запроса. Вложения отдаём только из самых
+    /// свежих сообщений, чтобы запрос не разросся до мегабайтов.
+    private func remoteHistory() -> [ProviderMessage] {
+        let recent = messages
+            .filter { !$0.text.isEmpty && !$0.text.hasPrefix("⏳") }
+            .suffix(10)
+        var result: [ProviderMessage] = []
+        for (offset, message) in recent.enumerated() {
+            let includeAttachments = offset >= recent.count - 4
+            let payloads: [AttachmentPayload] = includeAttachments
+                ? message.attachments.compactMap(Self.payload(for:))
+                : []
+            let text = message.text.isEmpty && !payloads.isEmpty ? "Опиши вложение." : message.text
+            guard !text.isEmpty else { continue }
+            result.append(ProviderMessage(role: message.role, text: text, attachments: payloads))
+        }
+        return result
     }
+
+    private static func payload(for attachment: ChatAttachment) -> AttachmentPayload? {
+        guard let data = AttachmentStore.data(forStoredName: attachment.storedName),
+              !data.isEmpty,
+              data.count <= PendingAttachment.maxSize else { return nil }
+        return AttachmentPayload(
+            kind: attachment.kind.capability,
+            mimeType: mimeType(for: attachment),
+            fileName: attachment.fileName,
+            data: data
+        )
+    }
+
+    private static func mimeType(for attachment: ChatAttachment) -> String {
+        let ext = (attachment.storedName as NSString).pathExtension.lowercased()
+        switch ext {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "heic": return "image/heic"
+        case "mp3", "mpeg": return "audio/mpeg"
+        case "m4a", "mp4", "aac": return "audio/mp4"
+        case "wav": return "audio/wav"
+        case "pdf": return "application/pdf"
+        case "txt": return "text/plain"
+        default: return "application/octet-stream"
+        }
+    }
+
+    /// Адрес файла вложения для просмотра.
+    func attachmentURL(messageID: UUID, attachment: ChatAttachment) -> URL? {
+        guard messages.contains(where: { $0.id == messageID }) else { return nil }
+        let url = AttachmentStore.url(forStoredName: attachment.storedName)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let urlError = error as? URLError {
+            return urlError.code == .cancelled
+        }
+        return false
+    }
+
+    private static func describe(_ error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            return providerError.localizedDescription
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .notConnectedToInternet, .networkConnectionLost, .timedOut:
+                return "Нет соединения с интернетом. Проверьте сеть и попробуйте ещё раз."
+            default:
+                return "Ошибка сети: \(urlError.localizedDescription)"
+            }
+        }
+        return error.localizedDescription
+    }
+
+    // MARK: Завершение генерации
 
     private func finishGeneration(token: UUID, replyID: UUID, promptChars: Int) {
         if let index = messages.firstIndex(where: { $0.id == replyID }) {
@@ -559,7 +891,7 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Длинные тексты
+    // MARK: - Длинные тексты (локальная модель)
 
     private struct PreparedPrompt {
         let prompt: String
@@ -720,12 +1052,18 @@ final class ChatViewModel: ObservableObject {
         return available == 0 || available > minBytes
     }
 
-    // MARK: - Сохранённые чаты
+    // MARK: - Сохранённые чаты (Core Data)
 
     var exportText: String {
         messages
             .filter { !$0.text.isEmpty && !$0.text.hasPrefix("⏳") }
-            .map { ($0.role == .user ? "Я: " : "ИИ: ") + $0.text }
+            .map { message -> String in
+                var line = (message.role == .user ? "Я: " : "ИИ: ") + message.text
+                for attachment in message.attachments {
+                    line += "\n[\(attachment.kind.capability.title): \(attachment.fileName)]"
+                }
+                return line
+            }
             .joined(separator: "\n\n")
     }
 
@@ -745,7 +1083,7 @@ final class ChatViewModel: ObservableObject {
             conversations.append(conversation)
         }
         conversations.sort { $0.updatedAt > $1.updatedAt }
-        persist()
+        CoreDataStack.shared.saveConversation(conversation)
     }
 
     func newChat() {
@@ -773,6 +1111,13 @@ final class ChatViewModel: ObservableObject {
     }
 
     func deleteChat(_ id: UUID) {
+        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        // Удаляем и файлы вложений этого чата.
+        for message in conversation.messages {
+            for attachment in message.attachments {
+                AttachmentStore.remove(storedName: attachment.storedName)
+            }
+        }
         conversations.removeAll { $0.id == id }
         if id == currentID {
             stop()
@@ -783,7 +1128,7 @@ final class ChatViewModel: ObservableObject {
                 sessionDirty = false
             }
         }
-        persist()
+        CoreDataStack.shared.deleteConversation(id: id)
     }
 
     func deleteAllChats() {
@@ -796,40 +1141,21 @@ final class ChatViewModel: ObservableObject {
             session = makeSession(for: container)
             sessionDirty = false
         }
-        persist()
+        AttachmentStore.removeAll()
+        CoreDataStack.shared.deleteAllConversations()
     }
 
     private static func title(from messages: [ChatMessage]) -> String {
-        guard let first = messages.first(where: { $0.role == .user })?.text else { return "Новый чат" }
-        let line = first
+        guard let first = messages.first(where: { $0.role == .user }) else { return "Новый чат" }
+        var source = first.text
+        if source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let attachment = first.attachments.first {
+            source = attachment.fileName
+        }
+        let line = source
             .components(separatedBy: "\n")
-            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? first
+            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? source
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.count > 40 ? String(trimmed.prefix(40)) + "…" : trimmed
-    }
-
-    private func persist() {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(conversations) else { return }
-        let url = storeURL
-        Self.writeQueue.async {
-            try? data.write(to: url, options: .atomic)
-        }
-    }
-
-    private static func makeStoreURL() -> URL {
-        let manager = FileManager.default
-        let base = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? manager.temporaryDirectory
-        try? manager.createDirectory(at: base, withIntermediateDirectories: true)
-        return base.appendingPathComponent("conversations.json")
-    }
-
-    private static func readConversations(from url: URL) -> [Conversation] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([Conversation].self, from: data)) ?? []
     }
 }

@@ -86,6 +86,7 @@ struct MessageRow: View, Equatable {
     let isCollapsed: Bool
     let onToggle: () -> Void
     let onRegenerate: () -> Void
+    let onOpenAttachment: (ChatAttachment) -> Void
 
     @State private var copied = false
 
@@ -114,10 +115,21 @@ struct MessageRow: View, Equatable {
         HStack {
             Spacer(minLength: 48)
             VStack(alignment: .trailing, spacing: 8) {
-                Text(isCollapsed ? String(message.text.prefix(500)) + "…" : message.text)
-                    .lineLimit(isCollapsed ? 6 : nil)
-                    .multilineTextAlignment(.leading)
-                    .foregroundColor(.white)
+                if !message.attachments.isEmpty {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        ForEach(message.attachments) { attachment in
+                            AttachmentChip(attachment: attachment) {
+                                onOpenAttachment(attachment)
+                            }
+                        }
+                    }
+                }
+                if !message.text.isEmpty {
+                    Text(isCollapsed ? String(message.text.prefix(500)) + "…" : message.text)
+                        .lineLimit(isCollapsed ? 6 : nil)
+                        .multilineTextAlignment(.leading)
+                        .foregroundColor(.white)
+                }
                 if isLong {
                     toggleButton
                 }

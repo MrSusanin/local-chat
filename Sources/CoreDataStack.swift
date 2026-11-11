@@ -1,158 +1,245 @@
 import CoreData
 import Foundation
+import os
 
+// MARK: - Объекты хранилища
+
+@objc(StoredConversationMO)
+final class StoredConversationMO: NSManagedObject {
+    @NSManaged var id: String
+    @NSManaged var title: String
+    @NSManaged var updatedAt: Date
+    @NSManaged var messages: Set<StoredMessageMO>
+}
+
+@objc(StoredMessageMO)
+final class StoredMessageMO: NSManagedObject {
+    @NSManaged var messageID: String
+    @NSManaged var role: String
+    @NSManaged var text: String
+    /// Порядок сообщения внутри чата. Без него Core Data возвращал бы сообщения вперемешку.
+    @NSManaged var sortIndex: Int64
+    @NSManaged var attachmentsJSON: String?
+    @NSManaged var conversation: StoredConversationMO?
+}
+
+// MARK: - Хранилище
+
+/// Сохранение чатов в Core Data. Все обращения идут из главного потока.
 final class CoreDataStack {
     static let shared = CoreDataStack()
 
     private let container: NSPersistentContainer
+    private let log = Logger(subsystem: "com.example.localchat", category: "CoreData")
 
     private init() {
-        let model = NSManagedObjectModel()
+        container = NSPersistentContainer(name: "LocalChatModel", managedObjectModel: Self.makeModel())
+        container.loadPersistentStores { [weak self] _, error in
+            if let error {
+                // assertionFailure здесь ломал бы сборку Release: просто пишем в журнал.
+                self?.log.error("Не удалось открыть хранилище: \(error.localizedDescription)")
+            }
+        }
+        container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+    }
 
+    var viewContext: NSManagedObjectContext { container.viewContext }
+
+    // MARK: Схема
+
+    private static func makeModel() -> NSManagedObjectModel {
         let conversationEntity = NSEntityDescription()
         conversationEntity.name = "StoredConversation"
-        conversationEntity.managedObjectClassName = NSStringFromClass(NSManagedObject.self)
+        conversationEntity.managedObjectClassName = "StoredConversationMO"
+
+        let messageEntity = NSEntityDescription()
+        messageEntity.name = "StoredMessage"
+        messageEntity.managedObjectClassName = "StoredMessageMO"
 
         let idAttribute = NSAttributeDescription.stringAttribute("id")
         let titleAttribute = NSAttributeDescription.stringAttribute("title")
         let updatedAtAttribute = NSAttributeDescription.dateAttribute("updatedAt")
 
-        let messageEntity = NSEntityDescription()
-        messageEntity.name = "StoredMessage"
-        messageEntity.managedObjectClassName = NSStringFromClass(NSManagedObject.self)
-
+        let messageIdAttribute = NSAttributeDescription.stringAttribute("messageID")
         let roleAttribute = NSAttributeDescription.stringAttribute("role")
         let textAttribute = NSAttributeDescription.stringAttribute("text")
-        let messageIdAttribute = NSAttributeDescription.stringAttribute("messageID")
-        let positionAttribute = NSAttributeDescription.integerAttribute("position")
+        let sortIndexAttribute = NSAttributeDescription.int64Attribute("sortIndex")
+        let attachmentsAttribute = NSAttributeDescription.stringAttribute("attachmentsJSON", optional: true)
 
+        // Связь «чат → сообщения» (многие) и обратная «сообщение → чат» (один).
+        // Раньше обратная связь была выставлена только с одной стороны —
+        // из-за этого сохранение падало с ошибкой валидации и чаты терялись.
         let messagesRelation = NSRelationshipDescription()
         messagesRelation.name = "messages"
         messagesRelation.destinationEntity = messageEntity
         messagesRelation.minCount = 0
-        messagesRelation.maxCount = 0
+        messagesRelation.maxCount = 0          // 0 означает «многие»
         messagesRelation.deleteRule = .cascadeDeleteRule
+        messagesRelation.isOptional = true
 
         let conversationRelation = NSRelationshipDescription()
         conversationRelation.name = "conversation"
         conversationRelation.destinationEntity = conversationEntity
-        conversationRelation.minCount = 1
+        conversationRelation.minCount = 0
         conversationRelation.maxCount = 1
         conversationRelation.deleteRule = .nullifyDeleteRule
+        conversationRelation.isOptional = true
 
         messagesRelation.inverseRelationship = conversationRelation
         conversationRelation.inverseRelationship = messagesRelation
 
         conversationEntity.properties = [idAttribute, titleAttribute, updatedAtAttribute, messagesRelation]
-        messageEntity.properties = [messageIdAttribute, roleAttribute, textAttribute, positionAttribute, conversationRelation]
+        messageEntity.properties = [
+            messageIdAttribute, roleAttribute, textAttribute, sortIndexAttribute,
+            attachmentsAttribute, conversationRelation
+        ]
+
+        let model = NSManagedObjectModel()
         model.entities = [conversationEntity, messageEntity]
-
-        container = NSPersistentContainer(name: "LocalChatModel", managedObjectModel: model)
-        let description = container.persistentStoreDescriptions.first
-        description?.shouldMigrateStoreAutomatically = true
-        description?.shouldInferMappingModelAutomatically = true
-        container.loadPersistentStores { _, error in
-            if let error {
-                assertionFailure("Core Data failed to load: \(error.localizedDescription)")
-            }
-        }
-        container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
-        container.viewContext.undoManager = nil
+        return model
     }
 
-    var viewContext: NSManagedObjectContext { container.viewContext }
+    // MARK: Чтение
 
-    func saveContext() throws {
-        let context = container.viewContext
-        guard context.hasChanges else { return }
-        try context.save()
-    }
-
-    func fetchConversations() throws -> [Conversation] {
-        let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
+    func fetchConversations() -> [Conversation] {
+        let request = NSFetchRequest<StoredConversationMO>(entityName: "StoredConversation")
         request.sortDescriptors = [NSSortDescriptor(key: "updatedAt", ascending: false)]
-        return try viewContext.fetch(request).compactMap(convert)
+        do {
+            return try viewContext.fetch(request).compactMap(Self.makeConversation)
+        } catch {
+            log.error("Не удалось прочитать чаты: \(error.localizedDescription)")
+            return []
+        }
     }
 
-    func saveConversation(_ conversation: Conversation) throws {
-        let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
-        request.fetchLimit = 1
+    // MARK: Запись
+
+    func saveConversation(_ conversation: Conversation) {
+        let context = viewContext
+        let request = NSFetchRequest<StoredConversationMO>(entityName: "StoredConversation")
         request.predicate = NSPredicate(format: "id == %@", conversation.id.uuidString)
 
-        let stored = try viewContext.fetch(request).first ?? NSEntityDescription.insertNewObject(
-            forEntityName: "StoredConversation",
-            into: viewContext
-        )
-        stored.setValue(conversation.id.uuidString, forKey: "id")
-        stored.setValue(conversation.title, forKey: "title")
-        stored.setValue(conversation.updatedAt, forKey: "updatedAt")
+        let existing = (try? context.fetch(request))?.first
+        let row = existing
+            ?? NSEntityDescription.insertNewObject(forEntityName: "StoredConversation", into: context) as! StoredConversationMO
 
-        let oldMessages = (stored.value(forKey: "messages") as? Set<NSManagedObject>) ?? []
-        oldMessages.forEach(viewContext.delete)
+        row.id = conversation.id.uuidString
+        row.title = conversation.title
+        row.updatedAt = conversation.updatedAt
+
+        // Сообщения заменяем целиком: так проще поддерживать их порядок.
+        let oldMessages = Array(row.messages)
+        for message in oldMessages { context.delete(message) }
 
         for (index, message) in conversation.messages.enumerated() {
-            let row = NSEntityDescription.insertNewObject(forEntityName: "StoredMessage", into: viewContext)
-            row.setValue(message.id.uuidString, forKey: "messageID")
-            row.setValue(message.role.rawValue, forKey: "role")
-            row.setValue(message.text, forKey: "text")
-            row.setValue(index, forKey: "position")
-            row.setValue(stored, forKey: "conversation")
+            let item = NSEntityDescription.insertNewObject(forEntityName: "StoredMessage", into: context) as! StoredMessageMO
+            item.messageID = message.id.uuidString
+            item.role = message.role.rawValue
+            item.text = message.text
+            item.sortIndex = Int64(index)
+            item.attachmentsJSON = Self.encodeAttachments(message.attachments)
+            item.conversation = row
         }
-        try saveContext()
+        saveContext()
     }
 
-    func deleteConversation(id: UUID) throws {
-        let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
-        request.fetchLimit = 1
+    func deleteConversation(id: UUID) {
+        let request = NSFetchRequest<StoredConversationMO>(entityName: "StoredConversation")
         request.predicate = NSPredicate(format: "id == %@", id.uuidString)
-        if let row = try viewContext.fetch(request).first {
+        for row in (try? viewContext.fetch(request)) ?? [] {
             viewContext.delete(row)
-            try saveContext()
+        }
+        saveContext()
+    }
+
+    func deleteAllConversations() {
+        let request = NSFetchRequest<StoredConversationMO>(entityName: "StoredConversation")
+        for row in (try? viewContext.fetch(request)) ?? [] {
+            viewContext.delete(row)
+        }
+        saveContext()
+    }
+
+    func saveContext() {
+        let context = viewContext
+        guard context.hasChanges else { return }
+        do {
+            try context.save()
+        } catch {
+            log.error("Не удалось сохранить чаты: \(error.localizedDescription)")
         }
     }
 
-    func deleteAllConversations() throws {
-        let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
-        try viewContext.fetch(request).forEach(viewContext.delete)
-        try saveContext()
+    // MARK: Перенос старого хранилища (JSON)
+
+    /// Один раз переносит чаты из старого файла conversations.json в Core Data,
+    /// чтобы при обновлении приложения история не пропала.
+    func migrateLegacyStoreIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: "didMigrateConversationsToCoreData") else { return }
+        defaults.set(true, forKey: "didMigrateConversationsToCoreData")
+
+        let manager = FileManager.default
+        let base = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? manager.temporaryDirectory
+        let legacy = base.appendingPathComponent("conversations.json")
+        guard manager.fileExists(atPath: legacy.path) else { return }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: legacy),
+              let old = try? decoder.decode([Conversation].self, from: data),
+              !old.isEmpty else {
+            return
+        }
+        for conversation in old {
+            saveConversation(conversation)
+        }
+        // Старый файл не удаляем, а переименовываем — как резервную копию.
+        try? manager.moveItem(at: legacy, to: legacy.appendingPathExtension("backup"))
+        log.info("Перенесено чатов из JSON: \(old.count)")
     }
 
-    private func convert(_ object: NSManagedObject) -> Conversation? {
-        guard
-            let rawID = object.value(forKey: "id") as? String,
-            let id = UUID(uuidString: rawID),
-            let title = object.value(forKey: "title") as? String,
-            let updatedAt = object.value(forKey: "updatedAt") as? Date,
-            let rows = object.value(forKey: "messages") as? Set<NSManagedObject>
-        else { return nil }
+    // MARK: Преобразования
 
-        let messages = rows.compactMap { row -> (Int, ChatMessage)? in
-            guard
-                let rawMessageID = row.value(forKey: "messageID") as? String,
-                let messageID = UUID(uuidString: rawMessageID),
-                let rawRole = row.value(forKey: "role") as? String,
-                let role = ChatMessage.Role(rawValue: rawRole),
-                let text = row.value(forKey: "text") as? String
-            else { return nil }
+    private static func makeConversation(_ row: StoredConversationMO) -> Conversation? {
+        guard let id = UUID(uuidString: row.id) else { return nil }
+        let messages = row.messages
+            .sorted { $0.sortIndex < $1.sortIndex }
+            .compactMap { item -> ChatMessage? in
+                guard let role = ChatMessage.Role(rawValue: item.role) else { return nil }
+                return ChatMessage(
+                    id: UUID(uuidString: item.messageID) ?? UUID(),
+                    role: role,
+                    text: item.text,
+                    attachments: decodeAttachments(item.attachmentsJSON)
+                )
+            }
+        return Conversation(id: id, title: row.title, updatedAt: row.updatedAt, messages: messages)
+    }
 
-            var message = ChatMessage(role: role, text: text)
-            message.id = messageID
-            let position = (row.value(forKey: "position") as? NSNumber)?.intValue ?? 0
-            return (position, message)
-        }
-        .sorted { $0.0 < $1.0 }
-        .map(\.1)
+    private static func encodeAttachments(_ attachments: [ChatAttachment]) -> String? {
+        guard !attachments.isEmpty else { return nil }
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(attachments) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
 
-        return Conversation(id: id, title: title, updatedAt: updatedAt, messages: messages)
+    private static func decodeAttachments(_ json: String?) -> [ChatAttachment] {
+        guard let json, let data = json.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([ChatAttachment].self, from: data)) ?? []
     }
 }
 
+// MARK: - Помощники для атрибутов
+
 private extension NSAttributeDescription {
-    static func stringAttribute(_ name: String) -> NSAttributeDescription {
+    static func stringAttribute(_ name: String, optional: Bool = false) -> NSAttributeDescription {
         let attribute = NSAttributeDescription()
         attribute.name = name
         attribute.attributeType = .stringAttributeType
-        attribute.isOptional = false
+        attribute.isOptional = optional
+        attribute.defaultValue = optional ? nil : ""
         return attribute
     }
 
@@ -164,7 +251,7 @@ private extension NSAttributeDescription {
         return attribute
     }
 
-    static func integerAttribute(_ name: String) -> NSAttributeDescription {
+    static func int64Attribute(_ name: String) -> NSAttributeDescription {
         let attribute = NSAttributeDescription()
         attribute.name = name
         attribute.attributeType = .integer64AttributeType

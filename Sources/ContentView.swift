@@ -1,7 +1,10 @@
 import SwiftUI
 import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
+    let appState: AppSessionStore
     @StateObject private var vm = ChatViewModel()
     @StateObject private var network = NetworkMonitor()
     @Environment(\.scenePhase) private var scenePhase
@@ -10,6 +13,16 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var atBottom = true
     @FocusState private var inputFocused: Bool
+
+    // Вложения к следующему сообщению.
+    @State private var pendingAttachments: [PendingAttachment] = []
+    @State private var photoItem: PhotosPickerItem?
+    @State private var showAudioPicker = false
+    @State private var showDocumentPicker = false
+    @State private var previewItem: PreviewItem?
+
+    // Черновик API ключа на экране выбора ИИ.
+    @State private var apiKeyDraft = ""
 
     private let suggestions = [
         "Объясни простыми словами, как работает интернет",
@@ -33,13 +46,17 @@ struct ContentView: View {
                 ToolbarItem(placement: .principal) {
                     statusHeader
                 }
-                if showsChat {
-                    ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
+                    if showsChat {
                         Button {
                             inputFocused = false
                             showHistory = true
                         } label: {
                             Image(systemName: "clock.arrow.circlepath")
+                        }
+                    } else if vm.canCloseModelSetup {
+                        Button("Назад") {
+                            vm.closeModelSetup()
                         }
                     }
                 }
@@ -57,8 +74,9 @@ struct ContentView: View {
                                 inputFocused = false
                                 showSettings = true
                             }
-                            Button("Сменить модель", systemImage: "cpu") {
-                                vm.unloadModel()
+                            Button("Сменить ИИ / модель", systemImage: "cpu") {
+                                inputFocused = false
+                                vm.openModelSetup()
                             }
                         } label: {
                             Image(systemName: "ellipsis.circle")
@@ -78,7 +96,20 @@ struct ContentView: View {
             HistoryView(vm: vm)
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView(vm: vm)
+            SettingsView(vm: vm, appState: appState)
+        }
+        .sheet(item: $previewItem) { item in
+            QuickLookSheet(url: item.url)
+        }
+        .fileImporter(isPresented: $showAudioPicker, allowedContentTypes: [.audio], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                importFile(url, kind: .audio)
+            }
+        }
+        .fileImporter(isPresented: $showDocumentPicker, allowedContentTypes: [.pdf, .plainText], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                importFile(url, kind: .document)
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             // В фоне GPU недоступен, поэтому генерацию останавливаем и сохраняем чат.
@@ -87,36 +118,63 @@ struct ContentView: View {
                 vm.saveCurrent()
             }
         }
-        .onAppear { vm.autoLoadIfPossible() }
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            photoItem = nil
+            Task { await importPhoto(item) }
+        }
+        .onChange(of: vm.provider) { old, new in
+            // Ключ прежнего провайдера сохраняем, черновик меняем на ключ нового.
+            commitAPIKey(for: old)
+            apiKeyDraft = vm.apiKey(for: new)
+        }
+        .onAppear {
+            vm.autoLoadIfPossible()
+            apiKeyDraft = vm.apiKey(for: vm.provider)
+        }
     }
 
-    /// Чат показываем сразу, даже пока модель запускается: можно читать историю и писать сообщение.
+    /// Чат показываем сразу, даже пока локальная модель запускается: можно читать историю
+    /// и писать сообщение. Для облачных провайдеров модель не нужна вовсе.
     private var showsChat: Bool {
-        vm.loadState == .ready || vm.loadState == .starting
+        if vm.showsModelSetup { return false }
+        if vm.provider == .local {
+            switch vm.loadState {
+            case .ready, .starting: return true
+            default: return false
+            }
+        }
+        return true
     }
 
     // MARK: - Заголовок со статусом
 
     private var statusInfo: (text: String, color: Color) {
+        if vm.provider != .local {
+            if vm.isGenerating { return (text: "Облако думает…", color: .orange) }
+            return vm.hasAPIKey
+                ? (text: "Готов · \(vm.modelDisplayName)", color: .green)
+                : (text: "Нет API ключа", color: .orange)
+        }
         switch vm.loadState {
         case .ready:
-            if vm.isGenerating { return (text: "Думает…", color: Color.orange) }
-            return (text: "Модель готова", color: Color.green)
+            if vm.isGenerating { return (text: "Думает…", color: .orange) }
+            return (text: "Модель готова", color: .green)
         case .starting:
-            return (text: "Запуск модели…", color: Color.orange)
+            return (text: "Запуск модели…", color: .orange)
         case .downloading(let progress):
-            return (text: "Загрузка \(Int(progress * 100))%", color: Color.orange)
+            return (text: "Загрузка \(Int(progress * 100))%", color: .orange)
         case .idle:
-            return (text: "Модель не загружена", color: Color.gray)
+            return (text: "Модель не загружена", color: .gray)
         case .failed:
-            return (text: "Ошибка модели", color: Color.red)
+            return (text: "Ошибка модели", color: .red)
         }
     }
 
     private var statusHeader: some View {
         let status = statusInfo
         return VStack(spacing: 1) {
-            Text("Локальный чат")
+            Text(vm.provider == .local ? "Локальный чат" : vm.provider.title)
                 .font(.headline)
             HStack(spacing: 5) {
                 Circle()
@@ -219,7 +277,11 @@ struct ContentView: View {
             isLong: vm.isLong(message),
             isCollapsed: vm.isCollapsed(message, streaming: streaming),
             onToggle: { vm.toggleCollapse(message.id) },
-            onRegenerate: { vm.regenerate() }
+            onRegenerate: { vm.regenerate() },
+            onOpenAttachment: { attachment in
+                previewItem = vm.attachmentURL(messageID: message.id, attachment: attachment)
+                    .map { PreviewItem(url: $0) }
+            }
         )
         .equatable()
     }
@@ -232,9 +294,19 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 Text("Чем могу помочь?")
                     .font(.title2.weight(.semibold))
-                Text("Всё работает на вашем iPhone, без интернета.")
+                Text(vm.provider == .local
+                     ? "Всё работает на вашем iPhone, без интернета."
+                     : "Ответы придут из облака \(vm.provider.title).")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+
+            if vm.provider != .local && !vm.hasAPIKey {
+                Button("Указать API ключ") {
+                    vm.openModelSetup()
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.orange)
             }
 
             VStack(spacing: 8) {
@@ -266,6 +338,12 @@ struct ContentView: View {
         !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var canAttach: Bool {
+        !vm.isGenerating
+    }
+
+    // MARK: - Поле ввода
+
     private var inputBar: some View {
         VStack(spacing: 6) {
             if let queued = vm.queuedPrompt {
@@ -282,15 +360,25 @@ struct ContentView: View {
                     }
                     .font(.caption.weight(.semibold))
                 }
-            } else if input.utf8.count > 3000 && !vm.isGenerating {
+            } else if input.utf8.count > 3000 && !vm.isGenerating && vm.provider == .local {
                 Text("Длинный текст: приложение прочитает его по частям, это займёт время")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
+            if !pendingAttachments.isEmpty {
+                attachmentChips
+            }
+
             HStack(alignment: .bottom, spacing: 8) {
+                if vm.provider != .local {
+                    attachmentButtons
+                }
+
                 TextField(
-                    vm.loadState == .ready ? "Сообщение" : "Сообщение (модель запускается…)",
+                    vm.provider == .local
+                        ? (vm.loadState == .ready ? "Сообщение" : "Сообщение (модель запускается…)")
+                        : "Сообщение",
                     text: $input,
                     axis: .vertical
                 )
@@ -301,19 +389,15 @@ struct ContentView: View {
                 Button {
                     if vm.isGenerating {
                         vm.stop()
-                    } else if vm.loadState == .ready {
-                        vm.send(input)
-                        input = ""
                     } else {
-                        vm.queue(input)
-                        input = ""
+                        sendCurrent()
                     }
                 } label: {
                     Image(systemName: vm.isGenerating ? "stop.circle.fill" : "arrow.up.circle.fill")
                         .font(.system(size: 34))
-                        .foregroundColor(vm.isGenerating || canSend ? .white : Color(white: 0.4))
+                        .foregroundColor(vm.isGenerating || canSend || !pendingAttachments.isEmpty ? .white : Color(white: 0.4))
                 }
-                .disabled(!vm.isGenerating && (!canSend || vm.queuedPrompt != nil))
+                .disabled(!vm.isGenerating && ((!canSend && pendingAttachments.isEmpty) || vm.queuedPrompt != nil))
             }
             .padding(.leading, 16)
             .padding(.trailing, 5)
@@ -328,48 +412,192 @@ struct ContentView: View {
         .background(.bar)
     }
 
-    // MARK: - Экран выбора и загрузки модели
+    /// Кнопки вложений появляются в зависимости от возможностей модели.
+    private var attachmentButtons: some View {
+        HStack(spacing: 12) {
+            if vm.supports(.image) {
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 21))
+                        .foregroundColor(canAttach ? .orange : Color(white: 0.4))
+                }
+                .disabled(!canAttach)
+            }
+            if vm.supports(.audio) {
+                Button {
+                    showAudioPicker = true
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 21))
+                        .foregroundColor(canAttach ? .orange : Color(white: 0.4))
+                }
+                .disabled(!canAttach)
+            }
+            if vm.supports(.document) {
+                Button {
+                    showDocumentPicker = true
+                } label: {
+                    Image(systemName: "doc")
+                        .font(.system(size: 21))
+                        .foregroundColor(canAttach ? .orange : Color(white: 0.4))
+                }
+                .disabled(!canAttach)
+            }
+        }
+        .padding(.bottom, 6)
+    }
+
+    private var attachmentChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(pendingAttachments) { attachment in
+                    HStack(spacing: 6) {
+                        Image(systemName: attachment.kind.systemImage)
+                            .font(.footnote)
+                        Text(attachment.fileName)
+                            .font(.footnote)
+                            .lineLimit(1)
+                        Button {
+                            pendingAttachments.removeAll { $0.id == attachment.id }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.footnote)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color(white: 0.22)))
+                    .foregroundColor(.orange)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    private func sendCurrent() {
+        let text = input
+        let attachments = pendingAttachments
+        vm.send(text, attachments: attachments)
+        input = ""
+        pendingAttachments = []
+    }
+
+    // MARK: - Выбор вложений
+
+    private func importPhoto(_ item: PhotosPickerItem) async {
+        guard let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty else { return }
+        var payload = data
+        var fileName = "photo"
+        if let image = UIImage(data: data) {
+            let prepared = image.preparedForUpload()
+            if let jpeg = prepared.jpegData(compressionQuality: 0.85) {
+                payload = jpeg
+                fileName = "photo.jpg"
+            }
+        }
+        guard payload.count <= PendingAttachment.maxSize else { return }
+        pendingAttachments.append(PendingAttachment(
+            kind: .image,
+            fileName: fileName,
+            mimeType: "image/jpeg",
+            data: payload
+        ))
+    }
+
+    private func importFile(_ url: URL, kind: ChatAttachment.Kind) {
+        let needsAccess = url.startAccessingSecurityScopedResource()
+        defer { if needsAccess { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url),
+              !data.isEmpty,
+              data.count <= PendingAttachment.maxSize else { return }
+        let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+        pendingAttachments.append(PendingAttachment(
+            kind: kind,
+            fileName: url.lastPathComponent,
+            mimeType: mime,
+            data: data
+        ))
+    }
+
+    // MARK: - Экран выбора ИИ и модели
 
     private var setupView: some View {
         ScrollView {
             VStack(spacing: 18) {
-                Image(systemName: "sparkles")
+                Image(systemName: vm.provider == .local ? "sparkles" : "cloud")
                     .font(.system(size: 56))
                     .foregroundStyle(.orange)
                     .padding(.top, 24)
 
-                Text("ИИ прямо на вашем iPhone")
+                Text(vm.provider == .local ? "ИИ прямо на вашем iPhone" : "ИИ в облаке \(vm.provider.title)")
                     .font(.title2.bold())
+                    .multilineTextAlignment(.center)
 
-                Text("Модель скачается один раз (лучше по Wi‑Fi). После этого чат работает без интернета.")
+                Text(vm.provider.summary)
                     .font(.subheadline)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
 
-                VStack(spacing: 10) {
-                    ForEach(ChatViewModel.models) { model in
-                        modelRow(model)
+                Picker("Провайдер", selection: $vm.provider) {
+                    ForEach(AIProvider.allCases) { provider in
+                        Text(provider.shortTitle).tag(provider)
                     }
                 }
+                .pickerStyle(.segmented)
 
-                setupStatus
+                if vm.provider == .local {
+                    VStack(spacing: 10) {
+                        ForEach(AIProvider.local.models) { model in
+                            modelRow(model)
+                        }
+                    }
+                    if vm.selectedLocalModel?.isSuper == true {
+                        Label(
+                            "Супер-модель занимает ~1,9 ГБ и требует много памяти. На iPhone с 4 ГБ ОЗУ она может не запуститься.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.yellow)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    setupStatus
+                } else {
+                    remoteSetup
+                }
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 24)
         }
+        .onAppear {
+            // Черновик ключа всегда свежий: его могли поменять в настройках.
+            apiKeyDraft = vm.apiKey(for: vm.provider)
+        }
     }
 
-    private func modelRow(_ model: ModelOption) -> some View {
-        let selected = vm.selectedModelID == model.id
+    private func modelRow(_ model: AIModelOption) -> some View {
+        let selected = vm.modelName == model.name
         return Button {
-            vm.selectedModelID = model.id
+            vm.selectModel(model.name, for: vm.provider)
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(selected ? Color.orange : Color.secondary)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(model.title).font(.headline)
+                    HStack(spacing: 6) {
+                        Text(model.title).font(.headline)
+                        if model.isSuper {
+                            Text("СУПЕР")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.orange.opacity(0.25)))
+                                .overlay(Capsule().stroke(Color.orange, lineWidth: 1))
+                                .foregroundColor(.orange)
+                        }
+                    }
                     Text(model.detail)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -390,6 +618,54 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .disabled(isBusy)
+    }
+
+    /// Настройка облачного провайдера: ключ + выбор модели.
+    private var remoteSetup: some View {
+        VStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("API ключ \(vm.provider.title)")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                SecureField("Введите API ключ", text: $apiKeyDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color(white: 0.13))
+                    )
+                    .foregroundStyle(.white)
+                Text("Ключ хранится в связке ключей устройства и уходит только на серверы \(vm.provider.title).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(spacing: 10) {
+                ForEach(vm.provider.models) { model in
+                    modelRow(model)
+                }
+            }
+
+            Button {
+                commitAPIKey(for: vm.provider)
+                vm.closeModelSetup()
+            } label: {
+                Text("Начать чат")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(Color.orange, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .foregroundColor(.black)
+            }
+            .padding(.top, 6)
+            .disabled(apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private func commitAPIKey(for provider: AIProvider) {
+        let trimmed = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        vm.updateAPIKey(trimmed, for: provider)
     }
 
     private var isBusy: Bool {
@@ -442,7 +718,7 @@ struct ContentView: View {
         Button {
             vm.loadModel()
         } label: {
-            Text("Скачать и запустить")
+            Text(vm.selectedLocalModel?.isSuper == true ? "Скачать супер-модель" : "Скачать и запустить")
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
@@ -453,16 +729,35 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Элемент для просмотра вложения
+
+private struct PreviewItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 // MARK: - Настройки
 
 private struct SettingsView: View {
     @ObservedObject var vm: ChatViewModel
+    let appState: AppSessionStore
     @Environment(\.dismiss) private var dismiss
     @State private var confirmDelete = false
+    @State private var apiKeyDraft = ""
 
     var body: some View {
         NavigationStack {
             Form {
+                if !appState.username.isEmpty {
+                    Section("Аккаунт") {
+                        LabeledContent("Логин", value: appState.username)
+                        Button("Выйти из аккаунта", role: .destructive) {
+                            dismiss()
+                            appState.logout()
+                        }
+                    }
+                }
+
                 Section {
                     ForEach(PerformanceMode.allCases) { mode in
                         Button {
@@ -488,9 +783,26 @@ private struct SettingsView: View {
                         }
                     }
                 } header: {
-                    Text("Нагрузка на телефон")
+                    Text("Нагрузка на телефон (локальная модель)")
                 } footer: {
                     Text("Режим не меняет саму модель и качество ответов. Он влияет на плавность интерфейса, нагрев и длину ответов. Применяется со следующего сообщения.")
+                }
+
+                if vm.provider != .local {
+                    Section {
+                        SecureField("API ключ", text: $apiKeyDraft)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("Сохранить ключ") {
+                            let trimmed = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                            vm.updateAPIKey(trimmed, for: vm.provider)
+                        }
+                        .disabled(apiKeyDraft == vm.apiKey(for: vm.provider))
+                    } header: {
+                        Text("API ключ \(vm.provider.title)")
+                    } footer: {
+                        Text("Ключ хранится в связке ключей устройства и уходит только на серверы \(vm.provider.title).")
+                    }
                 }
 
                 Section {
@@ -507,6 +819,8 @@ private struct SettingsView: View {
                     Button("Удалить все чаты", role: .destructive) {
                         confirmDelete = true
                     }
+                } footer: {
+                    Text("Чаты сохраняются в Core Data на устройстве и никуда не отправляются.")
                 }
             }
             .navigationTitle("Настройки")
@@ -515,6 +829,9 @@ private struct SettingsView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Готово") { dismiss() }
                 }
+            }
+            .onAppear {
+                apiKeyDraft = vm.apiKey(for: vm.provider)
             }
             .confirmationDialog(
                 "Удалить все сохранённые чаты?",

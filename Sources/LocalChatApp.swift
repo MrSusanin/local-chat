@@ -7,7 +7,7 @@ struct LocalChatApp: App {
     var body: some Scene {
         WindowGroup {
             if appState.isAuthenticated {
-                ContentView()
+                ContentView(appState: appState)
                     .preferredColorScheme(.dark)
             } else {
                 LoginView(appState: appState)
