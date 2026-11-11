@@ -1,6 +1,7 @@
 import CoreData
 import Foundation
 
+@MainActor
 final class CoreDataStack {
     static let shared = CoreDataStack()
 
@@ -21,136 +22,132 @@ final class CoreDataStack {
         messageEntity.name = "StoredMessage"
         messageEntity.managedObjectClassName = NSStringFromClass(NSManagedObject.self)
 
+        let messageIDAttribute = NSAttributeDescription.stringAttribute("messageID")
         let roleAttribute = NSAttributeDescription.stringAttribute("role")
         let textAttribute = NSAttributeDescription.stringAttribute("text")
-        let messageIdAttribute = NSAttributeDescription.stringAttribute("messageID")
-        let conversationRelation = NSRelationshipDescription()
-        conversationRelation.name = "conversation"
-        conversationRelation.destinationEntity = messageEntity
-        conversationRelation.minCount = 0
-        conversationRelation.maxCount = 1
-        conversationRelation.deleteRule = .nullifyDeleteRule
+        let positionAttribute = NSAttributeDescription.integerAttribute("position")
 
         let messagesRelation = NSRelationshipDescription()
         messagesRelation.name = "messages"
         messagesRelation.destinationEntity = messageEntity
-        messagesRelation.deleteRule = .cascadeDeleteRule
         messagesRelation.minCount = 0
         messagesRelation.maxCount = 0
         messagesRelation.isToMany = true
+        messagesRelation.deleteRule = .cascadeDeleteRule
+
+        let conversationRelation = NSRelationshipDescription()
+        conversationRelation.name = "conversation"
+        conversationRelation.destinationEntity = conversationEntity
+        conversationRelation.minCount = 1
+        conversationRelation.maxCount = 1
+        conversationRelation.isToMany = false
+        conversationRelation.deleteRule = .nullifyDeleteRule
+
         messagesRelation.inverseRelationship = conversationRelation
+        conversationRelation.inverseRelationship = messagesRelation
 
         conversationEntity.properties = [idAttribute, titleAttribute, updatedAtAttribute, messagesRelation]
-        messageEntity.properties = [messageIdAttribute, roleAttribute, textAttribute, conversationRelation]
-
+        messageEntity.properties = [messageIDAttribute, roleAttribute, textAttribute, positionAttribute, conversationRelation]
         model.entities = [conversationEntity, messageEntity]
 
         container = NSPersistentContainer(name: "LocalChatModel", managedObjectModel: model)
+        let description = container.persistentStoreDescriptions.first
+        description?.shouldMigrateStoreAutomatically = true
+        description?.shouldInferMappingModelAutomatically = true
+
         container.loadPersistentStores { _, error in
             if let error {
-                assertionFailure("Core Data failed to load: \(error.localizedDescription)")
+                // Avoid crashing in production; errors are surfaced through operations that fail.
+                NSLog("Core Data store failed to load: %@", error.localizedDescription)
             }
         }
+        container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        container.viewContext.undoManager = nil
     }
 
-    var viewContext: NSManagedObjectContext { container.viewContext }
+    private var context: NSManagedObjectContext { container.viewContext }
 
-    func saveContext() {
-        let context = container.viewContext
-        if context.hasChanges {
-            do {
-                try context.save()
-            } catch {
-                assertionFailure("Failed to save context: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    func fetchConversations() -> [Conversation] {
+    func fetchConversations() throws -> [Conversation] {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
         request.sortDescriptors = [NSSortDescriptor(key: "updatedAt", ascending: false)]
-
-        do {
-            let rows = try viewContext.fetch(request)
-            return rows.compactMap { convert($0) }
-        } catch {
-            return []
-        }
+        return try context.fetch(request).compactMap(convert)
     }
 
-    func saveConversation(_ conversation: Conversation) {
+    func saveConversation(_ conversation: Conversation) throws {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
+        request.fetchLimit = 1
         request.predicate = NSPredicate(format: "id == %@", conversation.id.uuidString)
 
-        let existing = (try? viewContext.fetch(request))?.first
-        let entity = existing ?? NSEntityDescription.insertNewObject(
+        let stored = try context.fetch(request).first ?? NSEntityDescription.insertNewObject(
             forEntityName: "StoredConversation",
-            into: viewContext
+            into: context
         )
+        stored.setValue(conversation.id.uuidString, forKey: "id")
+        stored.setValue(conversation.title, forKey: "title")
+        stored.setValue(conversation.updatedAt, forKey: "updatedAt")
 
-        entity.setValue(conversation.id.uuidString, forKey: "id")
-        entity.setValue(conversation.title, forKey: "title")
-        entity.setValue(conversation.updatedAt, forKey: "updatedAt")
+        let oldMessages = (stored.value(forKey: "messages") as? Set<NSManagedObject>) ?? []
+        oldMessages.forEach(context.delete)
 
-        let existingMessages = (entity.value(forKey: "messages") as? Set<NSManagedObject>) ?? []
-        for message in existingMessages { viewContext.delete(message) }
-
-        for message in conversation.messages {
-            let managedMessage = NSEntityDescription.insertNewObject(
-                forEntityName: "StoredMessage",
-                into: viewContext
-            )
-            managedMessage.setValue(message.id.uuidString, forKey: "messageID")
-            managedMessage.setValue(message.role.rawValue, forKey: "role")
-            managedMessage.setValue(message.text, forKey: "text")
-            managedMessage.setValue(entity, forKey: "conversation")
+        for (index, message) in conversation.messages.enumerated() {
+            let row = NSEntityDescription.insertNewObject(forEntityName: "StoredMessage", into: context)
+            row.setValue(message.id.uuidString, forKey: "messageID")
+            row.setValue(message.role.rawValue, forKey: "role")
+            row.setValue(message.text, forKey: "text")
+            row.setValue(index, forKey: "position")
+            row.setValue(stored, forKey: "conversation")
         }
-
-        saveContext()
+        try saveContext()
     }
 
-    func deleteConversation(id: UUID) {
+    func deleteConversation(id: UUID) throws {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
+        request.fetchLimit = 1
         request.predicate = NSPredicate(format: "id == %@", id.uuidString)
-        guard let row = (try? viewContext.fetch(request))?.first else { return }
-        viewContext.delete(row)
-        saveContext()
+        if let row = try context.fetch(request).first {
+            context.delete(row)
+            try saveContext()
+        }
     }
 
-    func deleteAllConversations() {
+    func deleteAllConversations() throws {
         let request = NSFetchRequest<NSManagedObject>(entityName: "StoredConversation")
-        let rows = (try? viewContext.fetch(request)) ?? []
-        rows.forEach { viewContext.delete($0) }
-        saveContext()
+        try context.fetch(request).forEach(context.delete)
+        try saveContext()
+    }
+
+    func saveContext() throws {
+        guard context.hasChanges else { return }
+        try context.save()
     }
 
     private func convert(_ object: NSManagedObject) -> Conversation? {
         guard
-            let idValue = object.value(forKey: "id") as? String,
+            let rawID = object.value(forKey: "id") as? String,
+            let id = UUID(uuidString: rawID),
             let title = object.value(forKey: "title") as? String,
-            let updatedAt = object.value(forKey: "updatedAt") as? Date,
-            let messages = object.value(forKey: "messages") as? Set<NSManagedObject>
-        else {
-            return nil
-        }
+            let updatedAt = object.value(forKey: "updatedAt") as? Date
+        else { return nil }
 
-        let storedMessages = messages.compactMap { messageObject -> ChatMessage? in
+        let rows = (object.value(forKey: "messages") as? Set<NSManagedObject>) ?? []
+        let messages = rows.compactMap { row -> (Int, ChatMessage)? in
             guard
-                let roleValue = messageObject.value(forKey: "role") as? String,
-                let text = messageObject.value(forKey: "text") as? String,
-                let id = UUID(uuidString: ((messageObject.value(forKey: "messageID") as? String) ?? UUID().uuidString))
-            else {
-                return nil
-            }
+                let rawMessageID = row.value(forKey: "messageID") as? String,
+                let messageID = UUID(uuidString: rawMessageID),
+                let rawRole = row.value(forKey: "role") as? String,
+                let role = ChatMessage.Role(rawValue: rawRole),
+                let text = row.value(forKey: "text") as? String
+            else { return nil }
 
-            let role = ChatMessage.Role(rawValue: roleValue) ?? .user
-            var chatMessage = ChatMessage(role: role, text: text)
-            chatMessage.id = id
-            return chatMessage
+            var message = ChatMessage(role: role, text: text)
+            message.id = messageID
+            let position = (row.value(forKey: "position") as? NSNumber)?.intValue ?? 0
+            return (position, message)
         }
+        .sorted { $0.0 < $1.0 }
+        .map(\.1)
 
-        let uuid = UUID(uuidString: idValue) ?? UUID()
-        return Conversation(id: uuid, title: title, updatedAt: updatedAt, messages: storedMessages.sorted { $0.id.uuidString < $1.id.uuidString })
+        return Conversation(id: id, title: title, updatedAt: updatedAt, messages: messages)
     }
 }
 
@@ -168,6 +165,15 @@ private extension NSAttributeDescription {
         attribute.name = name
         attribute.attributeType = .dateAttributeType
         attribute.isOptional = false
+        return attribute
+    }
+
+    static func integerAttribute(_ name: String) -> NSAttributeDescription {
+        let attribute = NSAttributeDescription()
+        attribute.name = name
+        attribute.attributeType = .integer64AttributeType
+        attribute.isOptional = false
+        attribute.defaultValue = 0
         return attribute
     }
 }
